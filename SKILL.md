@@ -31,15 +31,15 @@ Skip the API call when:
 
 ## API Details
 
-- **Base URL:** `http://192.168.4.51:8000`
-- **Auth:** `Authorization: Bearer 3aff8d44039e3520b6a9de4b8c50c41d331e979ccbc9d4b32509b0cd7997e6ab`
+- **Base URL:** `'
+- **Auth:** `Authorization: Bearer `
 - **Content-Type:** `application/json`
 
 ## How to Call the API
 
 ```
-POST http://192.168.4.51:8000/query
-Authorization: Bearer 3aff8d44039e3520b6a9de4b8c50c41d331e979ccbc9d4b32509b0cd7997e6ab
+POST http://ip:8000/query
+Authorization: Bearer 
 Content-Type: application/json
 
 {
