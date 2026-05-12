@@ -66,10 +66,16 @@ async def send_discord_message(discord_thread_id: int, content: str):
 
 # ─── Thread Deletion ─────────────────────────────────────────────────────────
 
+# Tracks threads pending deletion so the bot process can cancel via !keep
+# Key: discord_thread_id (int)  Value: asyncio.Task
+_pending_deletions: dict[int, asyncio.Task] = {}
+
+
 async def schedule_thread_deletion(discord_thread_id: int, triggered_by: str = "Plain"):
     """
     Posts a 10-second countdown in the Discord thread then deletes it.
-    Users can type !keep to cancel before the timer expires.
+    The bot.py process handles !keep cancellation via _pending_deletions —
+    when bot.py sees !keep it calls cancel_thread_deletion() below.
     """
     async def _do_delete():
         try:
@@ -86,22 +92,7 @@ async def schedule_thread_deletion(discord_thread_id: int, triggered_by: str = "
                 "Reply `!keep` to cancel."
             )
 
-            # Listen for !keep for 10 seconds
-            def check(m):
-                return (
-                    m.channel.id == discord_thread_id
-                    and m.content.strip().lower() == "!keep"
-                    and not m.author.bot
-                )
-
-            try:
-                await discord_client.wait_for("message", check=check, timeout=10.0)
-                # !keep received — cancel deletion
-                await channel.send("✅ Deletion cancelled. This thread will stay open.")
-                log.info(f"Thread {discord_thread_id} deletion cancelled via !keep")
-                return
-            except asyncio.TimeoutError:
-                pass  # No !keep — proceed with deletion
+            await asyncio.sleep(10)
 
             try:
                 await channel.delete()
@@ -110,11 +101,42 @@ async def schedule_thread_deletion(discord_thread_id: int, triggered_by: str = "
                 log.info(f"Thread {discord_thread_id} already gone")
             except discord.Forbidden:
                 log.warning(f"No permission to delete thread {discord_thread_id}")
-
+            except asyncio.CancelledError:
+                try:
+                    await channel.send("✅ Deletion cancelled. This thread will stay open.")
+                except Exception:
+                    pass
+        except asyncio.CancelledError:
+            log.info(f"Thread {discord_thread_id} deletion cancelled via !keep")
+            try:
+                channel = discord_client.get_channel(discord_thread_id)
+                if channel:
+                    await channel.send("✅ Deletion cancelled. This thread will stay open.")
+            except Exception:
+                pass
         except Exception as e:
             log.error(f"Error during thread deletion for {discord_thread_id}: {e}")
+        finally:
+            _pending_deletions.pop(discord_thread_id, None)
 
-    asyncio.ensure_future(_do_delete())
+    task = asyncio.ensure_future(_do_delete())
+    _pending_deletions[discord_thread_id] = task
+
+
+def cancel_thread_deletion(discord_thread_id: int) -> bool:
+    """
+    Called externally (or via a webhook endpoint) to cancel a pending deletion.
+    Returns True if a pending deletion was found and cancelled.
+    Note: In the Railway deployment, bot.py and webhook_server.py are separate
+    processes so this only works within the webhook_server process itself.
+    For cross-process cancellation, bot.py's own _deletion_tasks dict handles
+    !keep for user-triggered closes; Plain-triggered closes use this.
+    """
+    task = _pending_deletions.get(discord_thread_id)
+    if task and not task.done():
+        task.cancel()
+        return True
+    return False
 
 
 # ─── Webhook Handler ──────────────────────────────────────────────────────────
@@ -171,31 +193,31 @@ async def handle_plain_webhook(request: web.Request) -> web.Response:
 
     # ── Handle chat_sent / email_sent ─────────────────────────────────────────
 
-    # Only relay messages FROM agents — skip anything sent by the customer
-    # to avoid echoing their own messages back into Discord
-    actor = payload.get("actor", {}) or {}
-    actor_type = (actor.get("actorType") or "").upper()
-    if actor_type == "CUSTOMER":
-        log.info("Skipping customer-originated event to avoid echo")
-        return web.Response(status=200, text="OK")
-
-    # Extract message text — structure differs slightly between chat and email
+    # Extract message and actor based on event type
+    # Plain schema: chat events wrap content in payload.chat, email in payload.email
     if event_type == "thread.chat_sent":
-        message_text = (
-            payload.get("chatMessage", {}).get("text")
-            or payload.get("text")
-            or ""
-        )
+        chat_obj   = payload.get("chat", {}) or {}
+        message_text = chat_obj.get("text", "")
+        created_by = chat_obj.get("createdBy", {}) or {}
     else:  # thread.email_sent
+        email_obj  = payload.get("email", {}) or {}
         message_text = (
-            payload.get("email", {}).get("textContent")
-            or payload.get("textContent")
-            or payload.get("text")
+            email_obj.get("textContent")
+            or email_obj.get("text")
             or ""
         )
+        created_by = email_obj.get("createdBy", {}) or {}
 
+    # Skip if no text
     if not message_text:
         log.info(f"Webhook event {event_type} has no text content, skipping")
+        return web.Response(status=200, text="OK")
+
+    # Only relay messages FROM agents (actorType: user or machineUser)
+    # Skip customer-originated events to avoid echo loops
+    actor_type = (created_by.get("actorType") or "").lower()
+    if actor_type == "customer":
+        log.info("Skipping customer-originated event to avoid echo")
         return web.Response(status=200, text="OK")
 
     # Look up the Discord thread
@@ -205,13 +227,15 @@ async def handle_plain_webhook(request: web.Request) -> web.Response:
         log.warning(f"No Discord thread mapped for Plain thread {thread_id}")
         return web.Response(status=200, text="OK")
 
-    # Resolve agent name from actor field
+    # Resolve agent name — Plain sends user details in createdBy for user actors
     agent_name = (
-        actor.get("fullName")
-        or actor.get("name")
-        or actor.get("user", {}).get("fullName")
+        created_by.get("fullName")
+        or created_by.get("publicName")
+        or created_by.get("name")
         or "Support Agent"
     )
+    # Log full payload in debug mode to help diagnose future issues
+    log.debug(f"chat_sent payload: {payload}")
 
     discord_message = (
         f"**💬 Reply from {agent_name}:**\n"
@@ -230,9 +254,27 @@ async def handle_plain_webhook(request: web.Request) -> web.Response:
 
 # ─── Server Setup ─────────────────────────────────────────────────────────────
 
+async def handle_cancel_deletion(request: web.Request) -> web.Response:
+    """
+    Called by bot.py when a user types !keep in a Plain-triggered deletion thread.
+    POST /cancel-deletion  body: {"thread_id": 123456789}
+    """
+    try:
+        body = await request.json()
+        thread_id = int(body.get("thread_id", 0))
+        if not thread_id:
+            return web.Response(status=400, text="missing thread_id")
+        cancelled = cancel_thread_deletion(thread_id)
+        return web.json_response({"cancelled": cancelled})
+    except Exception as e:
+        log.error(f"cancel-deletion error: {e}")
+        return web.Response(status=500, text="error")
+
+
 async def start_webhook_server():
     app = web.Application()
     app.router.add_post("/plain-webhook", handle_plain_webhook)
+    app.router.add_post("/cancel-deletion", handle_cancel_deletion)
     app.router.add_get("/health", lambda r: web.Response(text="OK"))
 
     runner = web.AppRunner(app)
