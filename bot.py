@@ -17,7 +17,7 @@ import aiohttp
 import random
 import re
 import logging
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from collections import defaultdict
 from dotenv import load_dotenv
 import os
@@ -51,8 +51,12 @@ TOP_K_CHUNKS        = int(os.getenv("TOP_K_CHUNKS", "6"))
 MAX_RETRIEVED_CHARS = int(os.getenv("MAX_RETRIEVED_CHARS", "8000"))
 
 # Plain integration
-PLAIN_API_KEY       = os.getenv("PLAIN_API_KEY", "")
-PLAIN_LABEL_TYPE_ID = os.getenv("PLAIN_LABEL_TYPE_ID", "")   # optional: pre-tag tickets e.g. "Discord"
+PLAIN_API_KEY          = os.getenv("PLAIN_API_KEY", "")
+PLAIN_LABEL_TYPE_ID    = os.getenv("PLAIN_LABEL_TYPE_ID", "")
+# Internal URL of webhook_server — used to cancel Plain-triggered deletions via !keep
+# On Railway set this to the internal private URL of the webhook service
+# e.g. http://webhook.railway.internal:8080  or leave blank to skip cross-process cancel
+WEBHOOK_SERVER_URL     = os.getenv("WEBHOOK_SERVER_URL", "")
 
 # ─── Thread Map Persistence ───────────────────────────────────────────────────
 # Uses Redis when REDIS_URL is set (production/Railway), in-memory dict otherwise (local dev).
@@ -176,7 +180,7 @@ def detect_support_intent(message: str) -> tuple[bool, int]:
 class ConversationManager:
     def __init__(self):
         self.conversations: dict = defaultdict(
-            lambda: {"history": [], "last_active": datetime.utcnow()}
+            lambda: {"history": [], "last_active": datetime.now(timezone.utc)}
         )
 
     def _key(self, channel_id: int, user_id: int) -> tuple:
@@ -185,7 +189,7 @@ class ConversationManager:
     def add_message(self, channel_id: int, user_id: int, role: str, content: str):
         key = self._key(channel_id, user_id)
         self.conversations[key]["history"].append({"role": role, "content": content})
-        self.conversations[key]["last_active"] = datetime.utcnow()
+        self.conversations[key]["last_active"] = datetime.now(timezone.utc)
         if len(self.conversations[key]["history"]) > 20:
             self.conversations[key]["history"] = self.conversations[key]["history"][-20:]
 
@@ -201,12 +205,12 @@ class ConversationManager:
         key = self._key(channel_id, user_id)
         if key not in self.conversations or not self.conversations[key]["history"]:
             return False
-        return datetime.utcnow() - self.conversations[key]["last_active"] < timedelta(
+        return datetime.now(timezone.utc) - self.conversations[key]["last_active"] < timedelta(
             minutes=CONVERSATION_TTL_MINUTES
         )
 
     def cleanup_expired(self):
-        now = datetime.utcnow()
+        now = datetime.now(timezone.utc)
         expired = [
             k for k, v in self.conversations.items()
             if now - v["last_active"] > timedelta(minutes=CONVERSATION_TTL_MINUTES)
@@ -400,7 +404,7 @@ class BankrSupportBot(discord.Client):
             if len(self._handled_message_ids) > 1000:
                 self._handled_message_ids = set(sorted(self._handled_message_ids)[-500:])
 
-            now = datetime.utcnow()
+            now = datetime.now(timezone.utc)
             self.recently_flagged = {
                 k: v for k, v in self.recently_flagged.items()
                 if now - v < timedelta(minutes=REFLAG_COOLDOWN_MINUTES)
@@ -461,10 +465,10 @@ Rules:
         key = (channel_id, user_id)
         if key not in self.recently_flagged:
             return False
-        return datetime.utcnow() - self.recently_flagged[key] < timedelta(minutes=REFLAG_COOLDOWN_MINUTES)
+        return datetime.now(timezone.utc) - self.recently_flagged[key] < timedelta(minutes=REFLAG_COOLDOWN_MINUTES)
 
     def _mark_flagged(self, channel_id: int, user_id: int):
-        self.recently_flagged[(channel_id, user_id)] = datetime.utcnow()
+        self.recently_flagged[(channel_id, user_id)] = datetime.now(timezone.utc)
 
     def _is_disengaging(self, content: str) -> bool:
         low = content.strip().lower()
@@ -693,12 +697,31 @@ Rules:
 
         # Cancel a pending deletion if the user replies !keep
         if content.lower() == "!keep":
+            # Check bot.py-managed deletion tasks (user-triggered closes)
             task = self._deletion_tasks.get(thread_id)
             if task and not task.done():
                 task.cancel()
                 log.info(f"Thread deletion cancelled by {message.author} in {thread_id}")
-            else:
-                await message.reply("No deletion was scheduled.", mention_author=False)
+                return
+
+            # Check webhook_server-managed deletion tasks (Plain-triggered closes)
+            # by calling the cancel-deletion endpoint
+            if WEBHOOK_SERVER_URL:
+                try:
+                    async with aiohttp.ClientSession() as session:
+                        async with session.post(
+                            f"{WEBHOOK_SERVER_URL}/cancel-deletion",
+                            json={"thread_id": thread_id},
+                            timeout=aiohttp.ClientTimeout(total=5),
+                        ) as resp:
+                            data = await resp.json()
+                            if data.get("cancelled"):
+                                log.info(f"Plain-triggered deletion cancelled for thread {thread_id}")
+                                return
+                except Exception as e:
+                    log.warning(f"Could not reach webhook server to cancel deletion: {e}")
+
+            await message.reply("No deletion was scheduled.", mention_author=False)
             return
 
         # Close command — close ticket tracking then schedule deletion
