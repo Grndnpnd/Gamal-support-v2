@@ -230,9 +230,6 @@ class PlainClient:
         query = """
         mutation replyToThread($input: ReplyToThreadInput!) {
           replyToThread(input: $input) {
-            message {
-              id
-            }
             error {
               message
               type
