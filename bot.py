@@ -652,10 +652,15 @@ Rules:
         self,
         thread: discord.Thread,
         triggered_by: str = "user",
+        on_delete=None,
     ):
         """
         Posts a 10-second countdown warning in the thread then deletes it.
-        Stores the task in _deletion_tasks so it can be cancelled by !keep.
+        Stores the task in _deletion_tasks so !keep can cancel it.
+
+        on_delete: optional callback called just before deletion — used to
+                   close ticket tracking AFTER the countdown, not before,
+                   so that !keep messages still route through the ticket handler.
         """
         thread_id = thread.id
 
@@ -666,7 +671,12 @@ Rules:
                     "Reply `!keep` to cancel."
                 )
                 await asyncio.sleep(10)
-                # Re-fetch to make sure thread still exists before deleting
+                # Run the on_delete callback (e.g. close_ticket) before deleting
+                if on_delete:
+                    try:
+                        on_delete()
+                    except Exception as e:
+                        log.warning(f"on_delete callback error: {e}")
                 try:
                     await thread.delete()
                     log.info(f"Deleted ticket thread {thread_id} (triggered by {triggered_by})")
@@ -723,15 +733,19 @@ Rules:
             await message.reply("No deletion was scheduled.", mention_author=False)
             return
 
-        # Close command — close ticket tracking then schedule deletion
+        # Close command — schedule deletion but keep ticket tracked
+        # so !keep messages still route through this handler
         if content.lower() in {"!close", "!done", "!resolved"}:
-            self.tickets.close_ticket(thread_id, message.author.id)
             await message.reply(
                 "✅ Got it — ticket closed. Thanks for reaching out!",
                 mention_author=False,
             )
             log.info(f"User closed ticket in Discord thread {thread_id}")
-            await self._schedule_thread_deletion(message.channel, triggered_by="user")
+            await self._schedule_thread_deletion(
+                message.channel,
+                triggered_by="user",
+                on_delete=lambda: self.tickets.close_ticket(thread_id, message.author.id),
+            )
             return
 
         # Forward to Plain
