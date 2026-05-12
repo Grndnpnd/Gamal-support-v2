@@ -340,7 +340,6 @@ class PlainTicketManager:
         return await self.plain.reply_to_thread(
             thread_id=plain_thread_id,
             text=formatted,
-            send_as_customer=True,
         )
 
     def close_ticket(self, discord_thread_id: int, user_id: int):
