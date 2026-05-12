@@ -220,11 +220,9 @@ class PlainClient:
         self,
         thread_id: str,
         text: str,
-        send_as_customer: bool = True,
     ) -> bool:
         """
-        Send a message into an existing Plain thread.
-        When send_as_customer=True the message appears as coming from the customer.
+        Send a message into an existing Plain thread as the machine user.
         Returns True on success.
         """
         query = """
@@ -243,7 +241,6 @@ class PlainClient:
             "input": {
                 "threadId": thread_id,
                 "textContent": text,
-                "sendAsCustomer": send_as_customer,
             }
         }
 
