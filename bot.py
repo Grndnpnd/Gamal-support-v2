@@ -565,7 +565,7 @@ Rules:
         if discord_thread:
             return (
                 f"\n\n🎫 I've opened a support ticket for you in {discord_thread.mention}. "
-                f"Our team will respond there. You can also send additional details in that thread."
+                f"Our team will respond there. In that thread please provide your Bankr Wallet address, a description of your problem and any relevant screenshots regarding your issue. Doing this will ensure that we are able to help you as quickly as possible."
             )
         else:
             return (
