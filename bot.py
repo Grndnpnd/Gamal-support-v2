@@ -53,6 +53,8 @@ MAX_RETRIEVED_CHARS = int(os.getenv("MAX_RETRIEVED_CHARS", "8000"))
 # Plain integration
 PLAIN_API_KEY          = os.getenv("PLAIN_API_KEY", "")
 PLAIN_LABEL_TYPE_ID    = os.getenv("PLAIN_LABEL_TYPE_ID", "")
+# Role name to add to every ticket thread for mod/admin visibility
+MOD_ROLE_NAME          = os.getenv("MOD_ROLE_NAME", "Moderator")
 # Internal URL of webhook_server — used to cancel Plain-triggered deletions via !keep
 # On Railway set this to the internal private URL of the webhook service
 # e.g. http://webhook.railway.internal:8080  or leave blank to skip cross-process cancel
@@ -259,6 +261,7 @@ class PlainTicketManager:
         message: discord.Message,
         issue_summary: str,
         full_context: str,
+        bot_user: discord.ClientUser | None = None,
     ) -> discord.Thread | None:
         """
         Full flow: upsert customer → create Plain thread → create Discord thread → link them.
@@ -314,7 +317,24 @@ class PlainTicketManager:
         self._user_tickets[user.id] = discord_thread.id
         await register_thread_link(plain_thread_id, discord_thread.id)
 
-        # 5. Post welcome message in the new thread
+        # 5. Add moderators to the thread so they have visibility and can intervene
+        guild = message.guild
+        if guild:
+            mod_role = discord.utils.get(guild.roles, name=MOD_ROLE_NAME)
+            if mod_role:
+                added = 0
+                for member in mod_role.members:
+                    if (bot_user is None or member != bot_user) and not member.bot:
+                        try:
+                            await discord_thread.add_user(member)
+                            added += 1
+                        except Exception as e:
+                            log.warning(f"Could not add mod {member} to ticket thread: {e}")
+                log.info(f"Added {added} moderator(s) to ticket thread {discord_thread.id}")
+            else:
+                log.warning(f"Mod role '{MOD_ROLE_NAME}' not found in guild — no mods added to thread")
+
+        # 6. Post welcome message in the new thread
         await discord_thread.send(
             f"👋 Hey {user.mention}! A support ticket has been opened for you.\n\n"
             f"**Ticket ID:** `{plain_thread_id}`\n\n"
@@ -539,6 +559,7 @@ Rules:
             message=message,
             issue_summary=issue_summary,
             full_context=full_context,
+            bot_user=self.user,
         )
 
         if discord_thread:
