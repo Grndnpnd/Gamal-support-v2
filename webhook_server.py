@@ -139,16 +139,39 @@ def cancel_thread_deletion(discord_thread_id: int) -> bool:
     return False
 
 
+# ─── Idempotency cache ───────────────────────────────────────────────────────
+# Tracks recently relayed Plain event IDs to prevent duplicate posts.
+# Plain may retry webhooks if it doesn't receive a timely 200 response.
+# Uses a simple bounded set — old IDs are evicted once the set exceeds the limit.
+_relayed_event_ids: set[str] = set()
+_MAX_RELAYED_IDS = 500
+
+
+def _already_relayed(event_id: str) -> bool:
+    """Return True if this event has already been relayed to Discord."""
+    return event_id in _relayed_event_ids
+
+
+def _mark_relayed(event_id: str):
+    """Record that this event has been relayed. Evict oldest if over limit."""
+    global _relayed_event_ids
+    if len(_relayed_event_ids) >= _MAX_RELAYED_IDS:
+        # Evict half the set — simple but effective for this use case
+        evict = list(_relayed_event_ids)[:_MAX_RELAYED_IDS // 2]
+        for e in evict:
+            _relayed_event_ids.discard(e)
+    _relayed_event_ids.add(event_id)
+
+
 # ─── Webhook Handler ──────────────────────────────────────────────────────────
 
 async def handle_plain_webhook(request: web.Request) -> web.Response:
     """
     Handle incoming Plain webhook events.
-    We care about events where an agent (non-customer) replies to a thread.
+    Only relays messages from human agents (actorType: user).
+    Skips customer and machineUser events to prevent echo loops.
+    Uses event ID deduplication to prevent duplicate posts on Plain retries.
     """
-    # Optional signature check — add Plain-Webhook-Signature validation here
-    # if you set PLAIN_WEBHOOK_SECRET (see Plain docs: request-signing)
-
     try:
         body = await request.json()
     except Exception:
@@ -156,7 +179,13 @@ async def handle_plain_webhook(request: web.Request) -> web.Response:
         return web.Response(status=400, text="Bad Request")
 
     event_type = body.get("type", "")
-    log.info(f"Plain webhook received: {event_type}")
+    event_id   = body.get("id", "")
+    log.info(f"Plain webhook received: {event_type} (id={event_id})")
+
+    # Deduplication — Plain retries webhooks if it doesn't get a timely 200
+    if event_id and _already_relayed(event_id):
+        log.info(f"Duplicate event {event_id} — already relayed, skipping")
+        return web.Response(status=200, text="OK")
 
     # Events we care about:
     #   thread.chat_sent       — agent sent a chat message in Plain
@@ -213,11 +242,18 @@ async def handle_plain_webhook(request: web.Request) -> web.Response:
         log.info(f"Webhook event {event_type} has no text content, skipping")
         return web.Response(status=200, text="OK")
 
-    # Only relay messages FROM agents (actorType: user or machineUser)
-    # Skip customer-originated events to avoid echo loops
+    # Only relay messages from HUMAN agents (actorType: user)
+    # Skip:
+    #   - customer  → avoid echoing user's own messages back to Discord
+    #   - machineUser → our bot forwarded this message to Plain; relaying it
+    #                   back would create an echo loop in the ticket thread
     actor_type = (created_by.get("actorType") or "").lower()
-    if actor_type == "customer":
-        log.info("Skipping customer-originated event to avoid echo")
+    if actor_type in ("customer", "machineuser", "machine_user"):
+        log.info(f"Skipping {actor_type} event to prevent echo loop")
+        return web.Response(status=200, text="OK")
+
+    if actor_type != "user":
+        log.info(f"Skipping unknown actor type '{actor_type}' — only relaying human agent messages")
         return web.Response(status=200, text="OK")
 
     # Look up the Discord thread
@@ -227,15 +263,18 @@ async def handle_plain_webhook(request: web.Request) -> web.Response:
         log.warning(f"No Discord thread mapped for Plain thread {thread_id}")
         return web.Response(status=200, text="OK")
 
-    # Resolve agent name — Plain sends user details in createdBy for user actors
+    # Mark as relayed before posting so retries are caught even if posting is slow
+    if event_id:
+        _mark_relayed(event_id)
+
+    # Resolve agent name
     agent_name = (
         created_by.get("fullName")
         or created_by.get("publicName")
         or created_by.get("name")
         or "Support Agent"
     )
-    # Log full payload in debug mode to help diagnose future issues
-    log.debug(f"chat_sent payload: {payload}")
+    log.debug(f"Relaying {event_type} from {agent_name} to Discord thread {discord_thread_id}")
 
     discord_message = (
         f"**💬 Reply from {agent_name}:**\n"
@@ -243,7 +282,6 @@ async def handle_plain_webhook(request: web.Request) -> web.Response:
         f"_Reply in this thread to respond._"
     )
 
-    # Cap Discord message length
     if len(discord_message) > 1900:
         discord_message = discord_message[:1900] + "…"
 
