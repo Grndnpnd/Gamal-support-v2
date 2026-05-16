@@ -305,10 +305,11 @@ class PlainTicketManager:
         # 3. Create a private Discord thread on the original message
         thread_name = f"🎫 {user.display_name} – Support Ticket"
         try:
-            discord_thread = await message.create_thread(
+            discord_thread = await message.channel.create_thread(
                 name=thread_name[:100],
                 auto_archive_duration=1440,  # 24 hours
                 type=discord.ChannelType.private_thread,
+                invitable=False,
             )
         except discord.Forbidden:
             log.error("Bot lacks permission to create threads in this channel")
