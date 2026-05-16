@@ -242,31 +242,29 @@ async def handle_plain_webhook(request: web.Request) -> web.Response:
         log.info(f"Webhook event {event_type} has no text content, skipping")
         return web.Response(status=200, text="OK")
 
-    actor_type = (created_by.get("actorType") or "").lower()
+    # Skip messages forwarded by our bot — they are prefixed with [discord-relay]
+    # This prevents echo loops where forwarded messages get relayed back to Discord
+    if message_text.startswith("[discord-relay]"):
+        log.info("Skipping discord-relay prefixed message to prevent echo loop")
+        return web.Response(status=200, text="OK")
 
-    # For email_sent events the support email address sends on behalf of the
-    # assigned agent — actorType is machineUser (the email sender machine user)
-    # but it represents a real human reply. We allow these through and resolve
-    # the agent name from the thread assignee instead.
-    is_support_email = (
-        event_type == "thread.email_sent"
-        and actor_type in ("machineuser", "machine_user")
-    )
+    actor_type = (created_by.get("actorType") or "").lower()
 
     # Skip customer events — avoid echoing the user's own messages back
     if actor_type == "customer":
         log.info("Skipping customer event to prevent echo loop")
         return web.Response(status=200, text="OK")
 
-    # Skip machineUser events that are NOT support email relays
-    # (these are our bot forwarding Discord messages to Plain)
-    if actor_type in ("machineuser", "machine_user") and not is_support_email:
-        log.info("Skipping machineUser event to prevent echo loop")
-        return web.Response(status=200, text="OK")
-
-    # Skip anything that isn't a human user or support email relay
+    # Skip unknown actor types
     if actor_type not in ("user", "machineuser", "machine_user"):
         log.info(f"Skipping unknown actor type '{actor_type}'")
+        return web.Response(status=200, text="OK")
+
+    # For machineUser events: only allow email_sent through since that's how
+    # human agent email replies arrive (sent by support email machine user).
+    # All other machineUser events (chat forwarding etc) are skipped.
+    if actor_type in ("machineuser", "machine_user") and event_type != "thread.email_sent":
+        log.info("Skipping non-email machineUser event")
         return web.Response(status=200, text="OK")
 
     # Look up the Discord thread
@@ -280,18 +278,15 @@ async def handle_plain_webhook(request: web.Request) -> web.Response:
     if event_id:
         _mark_relayed(event_id)
 
-    # Resolve agent name
-    # For user actor: name is nested inside createdBy.user
-    # For support email relay: pull from thread assignee
-    # Fallback: "Support Agent"
+    # Resolve agent name from createdBy.user (Plain's structure for user actors)
     thread_obj = payload.get("thread", {}) or {}
     assignee   = thread_obj.get("assignee", {}) or {}
 
     agent_name = (
-        created_by.get("fullName")
-        or created_by.get("publicName")
-        or (created_by.get("user") or {}).get("fullName")
+        (created_by.get("user") or {}).get("fullName")
         or (created_by.get("user") or {}).get("publicName")
+        or created_by.get("fullName")
+        or created_by.get("publicName")
         or assignee.get("fullName")
         or assignee.get("publicName")
         or "Support Agent"
