@@ -359,8 +359,10 @@ class PlainTicketManager:
         if not plain_thread_id:
             return False
 
-        # Prefix with user name so agents know who typed it
-        formatted = f"{user.display_name}: {text}"
+        # Prefix with [discord-relay] so webhook_server.py can identify and skip
+        # this message when Plain echoes it back, preventing an echo loop.
+        # Also prefix with user name so agents know who typed it in Plain.
+        formatted = f"[discord-relay] {user.display_name}: {text}"
         return await self.plain.reply_to_thread(
             thread_id=plain_thread_id,
             text=formatted,
