@@ -738,7 +738,11 @@ Rules:
                 # Run the on_delete callback (e.g. close_ticket) before deleting
                 if on_delete:
                     try:
-                        on_delete()
+                        import inspect
+                        if inspect.iscoroutinefunction(on_delete):
+                            await on_delete()
+                        else:
+                            on_delete()
                     except Exception as e:
                         log.warning(f"on_delete callback error: {e}")
                 try:
@@ -805,12 +809,17 @@ Rules:
                 mention_author=False,
             )
             log.info(f"User closed ticket in Discord thread {thread_id}")
+            # Capture loop-local vars for the closure
+            _thread_id = thread_id
+            _user_id   = message.author.id
+
+            async def _close_and_delete():
+                await self.tickets.close_ticket(_thread_id, _user_id)
+
             await self._schedule_thread_deletion(
                 message.channel,
                 triggered_by="user",
-                on_delete=lambda: asyncio.ensure_future(
-                await self.tickets.close_ticket(thread_id, message.author.id)
-            ),
+                on_delete=_close_and_delete,
             )
             return
 
