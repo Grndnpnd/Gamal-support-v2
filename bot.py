@@ -56,7 +56,8 @@ MAX_RETRIEVED_CHARS = int(os.getenv("MAX_RETRIEVED_CHARS", "8000"))
 # Plain integration
 PLAIN_API_KEY          = os.getenv("PLAIN_API_KEY", "")
 PLAIN_LABEL_TYPE_ID    = os.getenv("PLAIN_LABEL_TYPE_ID", "")
-# Role name to add to every ticket thread for mod/admin visibility
+# Role names to add to every ticket thread (comma-separated)
+# e.g. MOD_ROLE_NAME=Moderator,Admin
 MOD_ROLE_NAME          = os.getenv("MOD_ROLE_NAME", "Moderator")
 # Internal URL of webhook_server — used to cancel Plain-triggered deletions via !keep
 # On Railway set this to the internal private URL of the webhook service
@@ -307,6 +308,7 @@ class PlainTicketManager:
             discord_thread = await message.create_thread(
                 name=thread_name[:100],
                 auto_archive_duration=1440,  # 24 hours
+                type=discord.ChannelType.private_thread,
             )
         except discord.Forbidden:
             log.error("Bot lacks permission to create threads in this channel")
@@ -321,22 +323,25 @@ class PlainTicketManager:
         await register_thread_link(plain_thread_id, discord_thread.id)
         await save_active_ticket(discord_thread.id, plain_thread_id, user.id)
 
-        # 5. Add moderators to the thread so they have visibility and can intervene
+        # 5. Add configured roles to the thread so they have visibility
+        # MOD_ROLE_NAME supports comma-separated values e.g. "Moderator,Admin"
         guild = message.guild
         if guild:
-            mod_role = discord.utils.get(guild.roles, name=MOD_ROLE_NAME)
-            if mod_role:
-                added = 0
-                for member in mod_role.members:
-                    if (bot_user is None or member != bot_user) and not member.bot:
-                        try:
-                            await discord_thread.add_user(member)
-                            added += 1
-                        except Exception as e:
-                            log.warning(f"Could not add mod {member} to ticket thread: {e}")
-                log.info(f"Added {added} moderator(s) to ticket thread {discord_thread.id}")
-            else:
-                log.warning(f"Mod role '{MOD_ROLE_NAME}' not found in guild — no mods added to thread")
+            role_names = [r.strip() for r in MOD_ROLE_NAME.split(",") if r.strip()]
+            for role_name in role_names:
+                role = discord.utils.get(guild.roles, name=role_name)
+                if role:
+                    added = 0
+                    for member in role.members:
+                        if (bot_user is None or member != bot_user) and not member.bot:
+                            try:
+                                await discord_thread.add_user(member)
+                                added += 1
+                            except Exception as e:
+                                log.warning(f"Could not add {member} ({role_name}) to ticket thread: {e}")
+                    log.info(f"Added {added} member(s) from '{role_name}' to ticket thread {discord_thread.id}")
+                else:
+                    log.warning(f"Role '{role_name}' not found in guild — skipping")
 
         # 6. Post welcome message in the new thread
         await discord_thread.send(
