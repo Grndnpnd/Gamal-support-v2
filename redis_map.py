@@ -120,3 +120,91 @@ async def delete_thread_link(plain_thread_id: str) -> None:
 def is_using_redis() -> bool:
     """Returns True if Redis is configured, False if using in-memory fallback."""
     return bool(REDIS_URL)
+
+
+# ─── Active Ticket Persistence ────────────────────────────────────────────────
+# Stores the two in-memory dicts from PlainTicketManager so they survive redeploys.
+#
+#   active_tickets:  discord_thread_id → plain_thread_id
+#   user_tickets:    discord_user_id   → discord_thread_id
+#
+# Both are stored as a single Redis hash under one key so they're always
+# written and read together atomically.
+
+ACTIVE_TICKETS_KEY = "active_tickets"
+USER_TICKETS_KEY   = "user_tickets"
+
+# In-memory fallback dicts (local dev without Redis)
+_active_tickets_mem: dict[int, str] = {}
+_user_tickets_mem:   dict[int, int] = {}
+
+
+async def save_active_ticket(
+    discord_thread_id: int,
+    plain_thread_id: str,
+    user_id: int,
+) -> None:
+    """
+    Persist an active ticket to Redis.
+    Called when a new ticket is opened.
+    """
+    r = _get_redis()
+    if r:
+        try:
+            pipe = r.pipeline()
+            await pipe.hset(ACTIVE_TICKETS_KEY, str(discord_thread_id), plain_thread_id)
+            await pipe.hset(USER_TICKETS_KEY,   str(user_id), str(discord_thread_id))
+            await pipe.execute()
+            log.info(f"Redis: saved active ticket discord={discord_thread_id} plain={plain_thread_id}")
+            return
+        except Exception as e:
+            log.error(f"Redis save_active_ticket failed: {e} — falling back to memory")
+
+    _active_tickets_mem[discord_thread_id] = plain_thread_id
+    _user_tickets_mem[user_id] = discord_thread_id
+
+
+async def delete_active_ticket(discord_thread_id: int, user_id: int) -> None:
+    """
+    Remove an active ticket from Redis.
+    Called when a ticket is closed or resolved.
+    """
+    r = _get_redis()
+    if r:
+        try:
+            pipe = r.pipeline()
+            await pipe.hdel(ACTIVE_TICKETS_KEY, str(discord_thread_id))
+            await pipe.hdel(USER_TICKETS_KEY,   str(user_id))
+            await pipe.execute()
+            log.info(f"Redis: deleted active ticket discord={discord_thread_id}")
+            return
+        except Exception as e:
+            log.error(f"Redis delete_active_ticket failed: {e}")
+
+    _active_tickets_mem.pop(discord_thread_id, None)
+    _user_tickets_mem.pop(user_id, None)
+
+
+async def load_active_tickets() -> tuple[dict[int, str], dict[int, int]]:
+    """
+    Load all active tickets from Redis on bot startup.
+    Returns (active_tickets, user_tickets) as plain dicts.
+
+    active_tickets: discord_thread_id (int) → plain_thread_id (str)
+    user_tickets:   discord_user_id (int)   → discord_thread_id (int)
+    """
+    r = _get_redis()
+    if r:
+        try:
+            raw_active = await r.hgetall(ACTIVE_TICKETS_KEY)
+            raw_users  = await r.hgetall(USER_TICKETS_KEY)
+
+            active_tickets = {int(k): v for k, v in raw_active.items()}
+            user_tickets   = {int(k): int(v) for k, v in raw_users.items()}
+
+            log.info(f"Redis: loaded {len(active_tickets)} active ticket(s) on startup")
+            return active_tickets, user_tickets
+        except Exception as e:
+            log.error(f"Redis load_active_tickets failed: {e} — starting with empty state")
+
+    return dict(_active_tickets_mem), dict(_user_tickets_mem)
