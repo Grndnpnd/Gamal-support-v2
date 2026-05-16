@@ -24,7 +24,10 @@ import os
 
 from plain_client import PlainClient
 from shared import SemanticDocsManager, OllamaClient
-from redis_map import set_thread_link, is_using_redis
+from redis_map import (
+    set_thread_link, is_using_redis,
+    save_active_ticket, delete_active_ticket, load_active_tickets,
+)
 
 load_dotenv()
 
@@ -312,10 +315,11 @@ class PlainTicketManager:
             log.error(f"Failed to create Discord thread: {e}")
             return None
 
-        # 4. Register the link
+        # 4. Register the link in memory and persist to Redis
         self._active_tickets[discord_thread.id] = plain_thread_id
         self._user_tickets[user.id] = discord_thread.id
         await register_thread_link(plain_thread_id, discord_thread.id)
+        await save_active_ticket(discord_thread.id, plain_thread_id, user.id)
 
         # 5. Add moderators to the thread so they have visibility and can intervene
         guild = message.guild
@@ -362,10 +366,23 @@ class PlainTicketManager:
             text=formatted,
         )
 
-    def close_ticket(self, discord_thread_id: int, user_id: int):
-        """Remove local tracking for a resolved ticket."""
+    async def load_from_redis(self) -> None:
+        """
+        Restore active ticket state from Redis on startup.
+        Called once from BankrSupportBot.on_ready so open tickets
+        survive service redeploys.
+        """
+        active, users = await load_active_tickets()
+        self._active_tickets.update(active)
+        self._user_tickets.update(users)
+        if active:
+            log.info(f"Restored {len(active)} active ticket(s) from Redis")
+
+    async def close_ticket(self, discord_thread_id: int, user_id: int) -> None:
+        """Remove local and Redis tracking for a resolved ticket."""
         self._active_tickets.pop(discord_thread_id, None)
         self._user_tickets.pop(user_id, None)
+        await delete_active_ticket(discord_thread_id, user_id)
 
 
 # ─── Bot ──────────────────────────────────────────────────────────────────────
@@ -412,6 +429,10 @@ class BankrSupportBot(discord.Client):
         else:
             log.warning("Thread map: in-memory only — set REDIS_URL for production")
 
+        # Restore open tickets from Redis so they survive redeploys
+        if self.tickets:
+            await self.tickets.load_from_redis()
+
         await self.docs.ensure_ready()
         asyncio.ensure_future(self._cleanup_loop())
 
@@ -457,23 +478,30 @@ Guidelines:
 
 Escalation:
 You have two escalation tags. Use them at the END of your response, never in the middle.
+These tags exist as a LAST RESORT — only after you have genuinely tried to help and hit a wall.
 
 [SUGGEST_ESCALATE: <one-line summary>]
-Use this when you have given the user something concrete to try but the issue may still need human help if it does not work.
-Example: you diagnosed a likely cause and gave steps, but it could be a backend issue.
-This tag tells the bot to add a follow-up note saying "if that doesn't fix it, reply and I'll open a ticket."
-The ticket is NOT opened yet — only if the user comes back saying it didn't work.
+Use this when ALL of the following are true:
+  1. You have already given the user a real answer with concrete steps to try
+  2. The issue might still require human help if those steps don't work
+  3. This is NOT the first message in the conversation
+Example: you gave troubleshooting steps for a wallet access issue but suspect it may be a backend problem.
+This tag adds a soft follow-up note — no ticket is opened yet.
 
 [NEEDS_TICKET: <one-line summary>]
-Use this when you have nothing useful to suggest and the issue clearly requires human investigation.
-Example: an error you cannot diagnose at all, a missing feature, account-level issues.
-This tag tells the bot to ask the user if they want a ticket opened. The ticket is NOT opened automatically.
+Use this when ALL of the following are true:
+  1. You have already attempted a doc-based answer and it was not sufficient
+  2. The issue clearly requires a human to investigate (account-level, backend bug, data issue)
+  3. This is NOT the first message in the conversation
+Example: user tried your suggestions and confirmed they didn't work, or the issue is completely outside the docs.
+This tag asks the user if they want a ticket — no ticket is opened automatically.
 
 Rules:
-- Use [SUGGEST_ESCALATE] when you have a partial or possible answer.
-- Use [NEEDS_TICKET] only when you have nothing to offer.
+- NEVER use either tag on the first message of a conversation. Always attempt to help first.
+- NEVER use either tag if you can fully answer the question from the documentation.
+- NEVER use either tag for general how-to questions, even complex ones — just answer them.
 - Never use both tags in the same response.
-- Do not escalate general how-to questions, chain support questions, or anything you can answer from the docs.
+- If you are unsure whether to escalate, do not escalate — answer as best you can instead.
 - For partnership/business inquiries: direct them to #partnership-request. Do NOT use either tag for those.
 
 --- RELEVANT BANKR DOCUMENTATION ---
@@ -565,7 +593,7 @@ Rules:
         if discord_thread:
             return (
                 f"\n\n🎫 I've opened a support ticket for you in {discord_thread.mention}. "
-                f"Our team will respond there. In that thread please provide your Bankr Wallet address, a description of your problem and any relevant screenshots regarding your issue. Doing this will ensure that we are able to help you as quickly as possible."
+                f"Our team will respond there. You can also send additional details in that thread."
             )
         else:
             return (
@@ -585,8 +613,23 @@ Rules:
         [NEEDS_TICKET: summary]
           Bot has nothing to suggest. Strips the tag, asks the user if they
           want a ticket opened. Ticket only opens if they say yes.
+
+        First-exchange guard: if this is the opening message of the conversation
+        (only 1 message in history = the one we just added), strip any escalation
+        tags silently. The bot must try to help at least once before escalating.
         """
         key = (message.channel.id, message.author.id)
+
+        # ── First-exchange guard ─────────────────────────────────────────────
+        # History already has the user message we just added, so length == 1
+        # means this is the very first exchange. Strip tags and don't escalate.
+        history = self.conversations.get_history(message.channel.id, message.author.id)
+        user_message_count = sum(1 for m in history if m["role"] == "user")
+        if user_message_count <= 1:
+            cleaned = re.sub(r"\s*\[(SUGGEST_ESCALATE|NEEDS_TICKET):[^\]]+\]", "", response, flags=re.IGNORECASE).strip()
+            if cleaned != response:
+                log.info(f"Stripped escalation tag on first exchange for {message.author}")
+            return cleaned
 
         # ── SUGGEST_ESCALATE — gave something to try, defer ticket ──────────
         suggest_match = re.search(r"\[SUGGEST_ESCALATE:\s*(.+?)\]", response, re.IGNORECASE)
@@ -765,7 +808,9 @@ Rules:
             await self._schedule_thread_deletion(
                 message.channel,
                 triggered_by="user",
-                on_delete=lambda: self.tickets.close_ticket(thread_id, message.author.id),
+                on_delete=lambda: asyncio.ensure_future(
+                await self.tickets.close_ticket(thread_id, message.author.id)
+            ),
             )
             return
 
