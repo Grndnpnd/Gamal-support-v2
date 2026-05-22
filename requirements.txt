@@ -6,3 +6,6 @@ sentence-transformers>=3.0.0
 fastapi>=0.110.0
 uvicorn[standard]>=0.29.0
 redis>=5.0.0
+# Admin panel dependencies (api_server.py /admin/* routes)
+itsdangerous>=2.2.0
+python-multipart>=0.0.9

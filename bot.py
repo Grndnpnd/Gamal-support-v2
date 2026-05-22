@@ -28,6 +28,7 @@ from redis_map import (
     set_thread_link, is_using_redis,
     save_active_ticket, delete_active_ticket, load_active_tickets,
 )
+from redis_overrides import find_matching_override, record_override_hit
 
 load_dotenv()
 
@@ -954,6 +955,90 @@ Rules:
         except Exception as e:
             log.error(f"Unexpected error in proactive offer: {e}")
 
+    # ── Doc Overrides ──────────────────────────────────────────────────────
+
+    async def _check_overrides(
+        self,
+        message: discord.Message,
+        content: str,
+        is_proactive: bool,
+        is_first_response: bool,
+    ) -> bool:
+        """
+        Check for an admin-configured doc override. If one matches, send the
+        override message and return True so the caller skips the normal LLM
+        flow entirely.
+
+        Two override modes (per-override flag):
+          - allow_ticket_offer=False (default): send the override message, done.
+          - allow_ticket_offer=True:  send the override message AND append the
+            standard "want a ticket?" prompt, then set pending escalation state
+            so the existing yes/no handler picks it up on the user's next reply.
+
+        Returns True if an override fired (caller stops). False if no match.
+        """
+        override = await find_matching_override(content)
+        if not override:
+            return False
+
+        response = override["message"]
+
+        # Mode B: still offer a ticket. Mirror NEEDS_TICKET shape so the
+        # existing _check_pending_escalation handler works without changes.
+        if override.get("allow_ticket_offer"):
+            key = (message.channel.id, message.author.id)
+            # Use the override name as the issue summary on the Plain ticket
+            self._pending_escalations[key] = (
+                f"Override triggered: {override.get('name', 'unknown')}"
+            )
+            response = (
+                response
+                + "\n\n💬 If you'd still like our team to take a look directly, "
+                "reply **yes** and I'll open a ticket for you."
+            )
+
+        # Proactive greeting and first-response footer apply the same way they
+        # would for a normal LLM answer — keeps the surface UX consistent.
+        if is_proactive:
+            greeting = f"Hey {message.author.mention}! 👋 I'm the Bankr support bot — \n\n"
+            response = greeting + response
+
+        if is_first_response:
+            footer = "\n\n-# _If this solved your issue, reply_ `!close` _or say thanks to end this conversation._"
+            response = response + footer
+
+        # Log the user message + override response into conversation history so
+        # follow-ups have context (e.g. "are you sure?" -> bot still knows what
+        # was said). Skipping this would make the override feel like a dead end.
+        self.conversations.add_message(
+            message.channel.id, message.author.id, "user", content,
+        )
+        self.conversations.add_message(
+            message.channel.id, message.author.id, "assistant", response,
+        )
+
+        # Discord 2000-char limit — chunk if needed (same logic as the main path).
+        if len(response) <= 1900:
+            await message.reply(response, mention_author=False)
+        else:
+            chunks = [response[i:i + 1900] for i in range(0, len(response), 1900)]
+            for i, chunk in enumerate(chunks):
+                if i == 0:
+                    await message.reply(chunk, mention_author=False)
+                else:
+                    await message.channel.send(chunk)
+
+        # Fire-and-forget hit counter — we don't want a Redis hiccup to block
+        # the user-facing path. The function itself is async but errors are
+        # caught inside record_override_hit.
+        asyncio.ensure_future(record_override_hit(override["id"]))
+
+        log.info(
+            f"Override fired: id={override['id']} name={override.get('name')!r} "
+            f"user={message.author} allow_ticket_offer={override.get('allow_ticket_offer')}"
+        )
+        return True
+
     async def _handle_support_message(
         self,
         message: discord.Message,
@@ -984,6 +1069,15 @@ Rules:
         # Check if the user is responding to a pending ticket offer (yes/no)
         # If handled, skip the normal LLM flow entirely
         if await self._check_pending_escalation(message, content):
+            return
+
+        # Check for admin-configured doc overrides (outage messages, etc).
+        # If one fires, it handles the full reply itself and we stop here —
+        # no docs query, no LLM call, no escalation tag parsing. The override
+        # may have set pending escalation state if its allow_ticket_offer
+        # flag is on; that gets picked up by _check_pending_escalation on the
+        # user's next message.
+        if await self._check_overrides(message, content, is_proactive, is_first_response):
             return
 
         self.conversations.add_message(message.channel.id, message.author.id, "user", content)

@@ -74,6 +74,16 @@ app = FastAPI(
     lifespan=lifespan,
 )
 
+# Mount the admin panel routes (/admin/*). Imported here rather than at the
+# top of the file so a missing dependency in admin_routes.py (e.g.
+# itsdangerous, python-multipart) doesn't take down the agent API.
+try:
+    from admin_routes import router as admin_router
+    app.include_router(admin_router)
+    log.info("Admin panel mounted at /admin")
+except ImportError as e:
+    log.warning(f"Admin panel disabled — missing dependency: {e}")
+
 security = HTTPBearer(auto_error=False)
 
 # ─── Simple in-memory rate limiter ───────────────────────────────────────────

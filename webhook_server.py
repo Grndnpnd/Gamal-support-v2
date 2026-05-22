@@ -17,12 +17,19 @@ Plain webhook setup:
 
 ENV vars used (add to your .env):
   WEBHOOK_PORT          - port to listen on (default: 8080)
-  WEBHOOK_SECRET        - optional secret to validate Plain requests (recommended)
   DISCORD_TOKEN         - reused from main bot env
-  PLAIN_WEBHOOK_SECRET  - optional, for request validation
+  PLAIN_WEBHOOK_SECRET  - shared HMAC secret from Plain workspace.
+                          Set in Plain: Settings → Request signing.
+                          If set, all incoming webhooks must be signed
+                          with this secret or they are rejected (403).
+                          If blank, signature verification is skipped
+                          and a warning is logged on startup.
 """
 
 import asyncio
+import hashlib
+import hmac
+import json
 import logging
 import os
 
@@ -163,6 +170,51 @@ def _mark_relayed(event_id: str):
     _relayed_event_ids.add(event_id)
 
 
+# ─── Signature Verification ──────────────────────────────────────────────────
+#
+# Plain signs outbound webhook requests with HMAC-SHA256 using a workspace-level
+# shared secret. The signature is the hex digest of the raw request body. It
+# arrives in the `Plain-Request-Signature` header.
+#
+# Reference: https://www.plain.com/docs/request-signing
+#
+# We compare using hmac.compare_digest to avoid timing attacks. If
+# PLAIN_WEBHOOK_SECRET is not set, verification is skipped entirely — useful
+# for local dev where you may be hitting the endpoint with curl, but a warning
+# is logged on startup so it's obvious in production logs.
+
+PLAIN_SIGNATURE_HEADER = "Plain-Request-Signature"
+
+
+def _verify_plain_signature(raw_body: bytes, signature_header: str | None) -> bool:
+    """
+    Verify the Plain-Request-Signature header against the raw request body.
+
+    Returns True if the signature is valid OR if no secret is configured
+    (signature verification disabled).  Returns False only when a secret IS
+    configured and the signature is missing or doesn't match.
+    """
+    if not PLAIN_WEBHOOK_SECRET:
+        # Verification disabled — accept everything. Startup logs flag this.
+        return True
+
+    if not signature_header:
+        log.warning("Webhook missing Plain-Request-Signature header — rejecting")
+        return False
+
+    expected = hmac.new(
+        PLAIN_WEBHOOK_SECRET.encode("utf-8"),
+        raw_body,
+        hashlib.sha256,
+    ).hexdigest()
+
+    if not hmac.compare_digest(expected, signature_header):
+        log.warning("Webhook signature mismatch — rejecting")
+        return False
+
+    return True
+
+
 # ─── Webhook Handler ──────────────────────────────────────────────────────────
 
 async def handle_plain_webhook(request: web.Request) -> web.Response:
@@ -172,8 +224,21 @@ async def handle_plain_webhook(request: web.Request) -> web.Response:
     Skips customer and machineUser events to prevent echo loops.
     Uses event ID deduplication to prevent duplicate posts on Plain retries.
     """
+    # Read the raw body bytes first — needed for HMAC signature verification.
+    # Calling request.json() would consume the body and we'd lose the raw form.
     try:
-        body = await request.json()
+        raw_body = await request.read()
+    except Exception as e:
+        log.warning(f"Failed to read webhook body: {e}")
+        return web.Response(status=400, text="Bad Request")
+
+    # Verify the Plain-Request-Signature header before doing any work.
+    signature_header = request.headers.get(PLAIN_SIGNATURE_HEADER)
+    if not _verify_plain_signature(raw_body, signature_header):
+        return web.Response(status=403, text="Forbidden")
+
+    try:
+        body = json.loads(raw_body)
     except Exception:
         log.warning("Received non-JSON webhook body")
         return web.Response(status=400, text="Bad Request")
@@ -337,6 +402,14 @@ async def start_webhook_server():
     site = web.TCPSite(runner, "0.0.0.0", WEBHOOK_PORT)
     await site.start()
     log.info(f"Plain webhook server listening on port {WEBHOOK_PORT}")
+    if PLAIN_WEBHOOK_SECRET:
+        log.info("Plain signature verification: ENABLED")
+    else:
+        log.warning(
+            "Plain signature verification: DISABLED — set PLAIN_WEBHOOK_SECRET "
+            "to require signed requests (configure secret in Plain: "
+            "Settings → Request signing)"
+        )
     if is_using_redis():
         log.info("Thread map: Redis ✅")
     else:

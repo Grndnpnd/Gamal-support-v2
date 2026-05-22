@@ -10,7 +10,7 @@ import asyncio
 import aiohttp
 import re
 import logging
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from dotenv import load_dotenv
 import os
 
@@ -63,7 +63,7 @@ class SemanticDocsManager:
         )
 
     async def ensure_ready(self):
-        now = datetime.utcnow()
+        now = datetime.now(timezone.utc)
         if (
             not self._ready
             or not self.last_fetched
@@ -191,7 +191,7 @@ class SemanticDocsManager:
                 ) as resp:
                     if resp.status == 200:
                         self.raw_content = await resp.text()
-                        self.last_fetched = datetime.utcnow()
+                        self.last_fetched = datetime.now(timezone.utc)
                         log.info(
                             f"Docs fetched ({len(self.raw_content):,} chars) — indexing..."
                         )
