@@ -24,6 +24,7 @@ import os
 
 from plain_client import PlainClient
 from shared import SemanticDocsManager, OllamaClient
+from llm_router import LLMRouter
 from redis_map import (
     set_thread_link, is_using_redis,
     save_active_ticket, delete_active_ticket, load_active_tickets,
@@ -405,7 +406,10 @@ class BankrSupportBot(discord.Client):
 
         self.docs          = SemanticDocsManager()
         self.conversations = ConversationManager()
-        self.ollama        = OllamaClient()
+        # self.ollama is the LLM router: tries Bankr gateway first, falls back
+        # to Ollama Cloud (Gemma) on failure. Attribute kept named "ollama" so
+        # existing call sites (self.ollama.chat(...)) don't change.
+        self.ollama        = LLMRouter()
         self.plain         = PlainClient(PLAIN_API_KEY) if PLAIN_API_KEY else None
         self.tickets       = PlainTicketManager(self.plain) if self.plain else None
 

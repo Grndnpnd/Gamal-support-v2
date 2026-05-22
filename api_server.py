@@ -38,6 +38,7 @@ from pydantic import BaseModel
 import uvicorn
 
 from shared import SemanticDocsManager, OllamaClient
+from llm_router import LLMRouter
 
 load_dotenv()
 
@@ -53,7 +54,9 @@ if not API_SERVER_KEY:
 # ─── Shared instances ─────────────────────────────────────────────────────────
 
 docs   = SemanticDocsManager()
-ollama = OllamaClient()
+# LLM router: Bankr gateway primary, Ollama Cloud (Gemma) fallback.
+# Variable kept named "ollama" so endpoint code is unchanged.
+ollama = LLMRouter()
 
 # ─── App ──────────────────────────────────────────────────────────────────────
 
