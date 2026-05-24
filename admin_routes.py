@@ -39,6 +39,7 @@ from redis_overrides import (
     list_overrides,
     update_override,
 )
+from redis_settings import get_settings, update_settings
 
 log = logging.getLogger(__name__)
 
@@ -372,6 +373,7 @@ async def logout():
 @router.get("", response_class=HTMLResponse)
 @router.get("/", response_class=HTMLResponse)
 async def dashboard(_: None = Depends(require_admin)):
+    settings = await get_settings()
     overrides = await list_overrides(only_active=False)
     # Sort newest first
     overrides.sort(key=lambda o: o.get("created_at", ""), reverse=True)
@@ -427,8 +429,49 @@ async def dashboard(_: None = Depends(require_admin)):
         '<div class="empty">No overrides yet. Create one to take over the bot\'s responses for matching keywords.</div>'
     )
 
+    # Busy-mode panel state
+    busy_on = settings.get("busy_mode_enabled", False)
+    busy_roles_value = ", ".join(settings.get("busy_mode_roles", []))
+    busy_status_pill = (
+        '<span class="pill warn">busy mode ON</span>'
+        if busy_on else '<span class="pill off">busy mode off</span>'
+    )
+
     body = f"""
-    <h2>Doc Overrides</h2>
+    <h2>Bot Controls</h2>
+    <p class="dim">
+      Operational toggles and response overrides for the Gamal support bot.
+    </p>
+
+    <div class="panel">
+      <h3>Busy mode &nbsp; {busy_status_pill}</h3>
+      <p class="dim">
+        When busy mode is on, the bot stops sending <strong>passive proactive
+        offers</strong> to members holding the staff roles below. Use it during
+        high-traffic windows so the bot doesn't jump in on your support team's
+        messages while they're helping customers live. Staff can still
+        <strong>@mention</strong> the bot directly — only the uninvited
+        proactive path is suppressed.
+      </p>
+      <form method="POST" action="/admin/settings/busy-mode">
+        <label class="inline">
+          <input type="checkbox" name="busy_mode_enabled" value="1" {"checked" if busy_on else ""}>
+          Enable busy mode
+        </label>
+
+        <label>Staff roles to ignore on the passive path
+          <small class="hint">Comma-separated Discord role names. Case-insensitive. e.g. Moderator, Support, Admin</small>
+        </label>
+        <input type="text" name="busy_mode_roles" value="{_esc(busy_roles_value)}"
+               placeholder="Moderator, Support">
+
+        <div style="margin-top: 16px;">
+          <button type="submit">Save busy mode</button>
+        </div>
+      </form>
+    </div>
+
+    <h2 style="margin-top:36px;">Doc Overrides</h2>
     <p class="dim">
       Overrides intercept incoming messages that match any keyword and reply
       with your message instead of the doc-based answer. Useful during outages
@@ -470,7 +513,32 @@ async def dashboard(_: None = Depends(require_admin)):
       </form>
     </div>
     """
-    return HTMLResponse(_page("Overrides", body))
+    return HTMLResponse(_page("Bot Controls", body))
+
+
+# ─── Bot Settings ─────────────────────────────────────────────────────────────
+
+@router.post("/settings/busy-mode")
+async def settings_busy_mode(
+    request: Request,
+    busy_mode_enabled: Optional[str] = Form(None),
+    busy_mode_roles: str = Form(""),
+    _: None = Depends(require_admin),
+):
+    """
+    Save the busy-mode toggle and its staff role list.
+
+    An unchecked checkbox submits no value at all, so busy_mode_enabled being
+    None means "off" — that's the standard HTML form checkbox behavior.
+    """
+    _check_csrf(request)
+
+    roles = [r.strip() for r in busy_mode_roles.split(",") if r.strip()]
+    await update_settings(
+        busy_mode_enabled=bool(busy_mode_enabled),
+        busy_mode_roles=roles,
+    )
+    return RedirectResponse("/admin", status_code=303)
 
 
 # ─── Override CRUD ────────────────────────────────────────────────────────────

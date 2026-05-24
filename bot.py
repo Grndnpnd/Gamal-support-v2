@@ -30,6 +30,7 @@ from redis_map import (
     save_active_ticket, delete_active_ticket, load_active_tickets,
 )
 from redis_overrides import find_matching_override, record_override_hit
+from redis_settings import get_settings
 
 load_dotenv()
 
@@ -530,6 +531,42 @@ Rules:
     def _mark_flagged(self, channel_id: int, user_id: int):
         self.recently_flagged[(channel_id, user_id)] = datetime.now(timezone.utc)
 
+    async def _is_busy_mode_suppressed(self, message: discord.Message) -> bool:
+        """
+        Busy mode: when an admin has enabled it from the panel, the bot stops
+        sending passive proactive offers to members holding configured staff
+        roles (Moderator, Support, etc). The point is high-traffic windows —
+        when the support team is answering customers live in channels, the bot
+        shouldn't keep jumping in on the team's own messages.
+
+        Returns True if this message's author should be skipped on the passive
+        path. Only consulted from Case 3 (passive monitoring) — direct mentions
+        and active conversations are never suppressed, so staff can always
+        @mention the bot deliberately.
+        """
+        settings = await get_settings()
+        if not settings.get("busy_mode_enabled"):
+            return False
+
+        # message.author is a Member in a guild channel (has .roles); in the
+        # rare case it's a plain User (e.g. DM), there are no roles to match.
+        author_roles = getattr(message.author, "roles", None)
+        if not author_roles:
+            return False
+
+        busy_roles = {r.lower() for r in settings.get("busy_mode_roles", []) if r.strip()}
+        if not busy_roles:
+            return False
+
+        for role in author_roles:
+            if role.name.lower() in busy_roles:
+                log.info(
+                    f"Busy mode: suppressing passive offer for {message.author} "
+                    f"(role '{role.name}')"
+                )
+                return True
+        return False
+
     def _is_disengaging(self, content: str) -> bool:
         low = content.strip().lower()
         if low in DISENGAGE_COMMANDS:
@@ -937,6 +974,11 @@ Rules:
             return
 
         if self._was_recently_flagged(message.channel.id, message.author.id):
+            return
+
+        # Busy mode — if an admin has it on, don't passively ping staff roles.
+        # This only gates the proactive path; staff can still @mention the bot.
+        if await self._is_busy_mode_suppressed(message):
             return
 
         flagged, score = detect_support_intent(message.content)
