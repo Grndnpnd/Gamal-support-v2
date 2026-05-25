@@ -350,9 +350,17 @@ _BASE_STYLE = """
   /* ── Stat cards ── */
   .stat-grid {
     display: grid;
-    grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
+    /* Fixed 4 columns -> 8 cards land as a clean 4x2 block, no orphan row.
+       Steps down to 2, then 1, on narrower screens. */
+    grid-template-columns: repeat(4, 1fr);
     gap: 14px;
     margin-bottom: 20px;
+  }
+  @media (max-width: 920px) {
+    .stat-grid { grid-template-columns: repeat(2, 1fr); }
+  }
+  @media (max-width: 480px) {
+    .stat-grid { grid-template-columns: 1fr; }
   }
   .stat-card {
     background: linear-gradient(180deg, var(--panel) 0%, var(--bg-2) 100%);
