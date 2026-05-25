@@ -253,6 +253,7 @@ async def get_summary(since: datetime, until: datetime) -> dict:
                 SELECT
                     count(*)                                              AS total,
                     count(*) FILTER (WHERE resolved_by_bot)               AS resolved,
+                    count(*) FILTER (WHERE response_source = 'escalated') AS escalated,
                     count(*) FILTER (WHERE plain_thread_id IS NOT NULL)   AS tickets,
                     count(*) FILTER (WHERE doc_gap)                       AS doc_gaps,
                     count(*) FILTER (WHERE response_source = 'error')     AS errors,
@@ -269,6 +270,7 @@ async def get_summary(since: datetime, until: datetime) -> dict:
             "total": total,
             "resolved": resolved,
             "resolved_rate": round(100 * resolved / total, 1) if total else 0.0,
+            "escalated": row["escalated"] or 0,
             "tickets": row["tickets"] or 0,
             "doc_gaps": row["doc_gaps"] or 0,
             "errors": row["errors"] or 0,

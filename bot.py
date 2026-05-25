@@ -421,6 +421,12 @@ class BankrSupportBot(discord.Client):
         # Tracks users who have been asked "want a ticket?" but haven't answered yet.
         # Key: (channel_id, user_id)  Value: issue summary string
         self._pending_escalations: dict[tuple, str]     = {}
+        # Parallel to _pending_escalations: the conversations-table row id of the
+        # message that triggered the escalation offer. When the user later says
+        # "yes" and a ticket is created, we backfill plain_thread_id onto that
+        # row via db.update_conversation_ticket — so "tickets created" stats are
+        # accurate. Keyed the same way as _pending_escalations.
+        self._pending_row_ids: dict[tuple, int]         = {}
         # Tracks threads currently in the deletion countdown so !keep can cancel
         self._deletion_tasks: dict[int, asyncio.Task]    = {}
 
@@ -482,6 +488,7 @@ class BankrSupportBot(discord.Client):
             ]
             for k in stale_pending:
                 del self._pending_escalations[k]
+                self._pending_row_ids.pop(k, None)
             if stale_pending:
                 log.info(f"Cleared {len(stale_pending)} stale pending escalations")
 
@@ -637,6 +644,7 @@ Choose the single best-fit value from this fixed list ONLY:
         self.conversations.clear(message.channel.id, message.author.id)
         # Also clear any pending ticket offer so it doesn't linger
         self._pending_escalations.pop((message.channel.id, message.author.id), None)
+        self._pending_row_ids.pop((message.channel.id, message.author.id), None)
         replies = [
             "Glad I could help! Feel free to ping me anytime 👋",
             "No problem! Come back if you have more questions 😊",
@@ -668,16 +676,20 @@ Choose the single best-fit value from this fixed list ONLY:
         message: discord.Message,
         issue_summary: str,
         original_content: str,
-    ) -> str:
+    ) -> tuple[str, str | None]:
         """
         Actually opens a Plain ticket + Discord thread.
-        Returns a string to append to the bot's response.
+        Returns (suffix, plain_thread_id) where:
+          suffix          - string to append to the bot's response
+          plain_thread_id - the Plain thread id if a ticket was created/forwarded
+                            to, else None. Used to backfill the stats row.
         """
         if not self.tickets:
             log.warning("Plain not configured; cannot open ticket")
             return (
                 "\n\n⚠️ This looks like it needs human attention. "
-                "Please open a ticket in **#bug-reports** and our team will help you."
+                "Please open a ticket in **#bug-reports** and our team will help you.",
+                None,
             )
 
         # User already has an open ticket — forward to it instead
@@ -685,9 +697,11 @@ Choose the single best-fit value from this fixed list ONLY:
         if existing_thread_id:
             full_context = self._build_ticket_context(message, original_content)
             await self.tickets.forward_to_plain(existing_thread_id, message.author, original_content)
+            existing_plain_id = self.tickets.get_plain_thread_id(existing_thread_id)
             return (
                 f"\n\n📋 I've added this to your existing support ticket. "
-                f"Check <#{existing_thread_id}> for updates from our team."
+                f"Check <#{existing_thread_id}> for updates from our team.",
+                existing_plain_id,
             )
 
         full_context = self._build_ticket_context(message, original_content)
@@ -699,14 +713,17 @@ Choose the single best-fit value from this fixed list ONLY:
         )
 
         if discord_thread:
+            plain_thread_id = self.tickets.get_plain_thread_id(discord_thread.id)
             return (
                 f"\n\n🎫 I've opened a support ticket for you in {discord_thread.mention}. "
-                f"Our team will respond there. You can also send additional details in that thread."
+                f"Our team will respond there. You can also send additional details in that thread.",
+                plain_thread_id,
             )
         else:
             return (
                 "\n\n⚠️ I wasn't able to create a ticket automatically. "
-                "Please head to **#bug-reports** and our team will help you out."
+                "Please head to **#bug-reports** and our team will help you out.",
+                None,
             )
 
     async def _maybe_escalate(self, message: discord.Message, response: str, original_content: str) -> str:
@@ -797,16 +814,30 @@ Choose the single best-fit value from this fixed list ONLY:
 
         if is_yes:
             del self._pending_escalations[key]
-            suffix = await self._open_ticket_for_user(message, issue_summary, content)
+            # Pull (and clear) the row id of the message that triggered this
+            # escalation offer, so we can backfill the ticket onto it.
+            row_id = self._pending_row_ids.pop(key, None)
+
+            suffix, plain_thread_id = await self._open_ticket_for_user(
+                message, issue_summary, content
+            )
             await message.reply(
                 "On it! Opening a ticket now..." + suffix,
                 mention_author=False,
             )
+
+            # Backfill the stats row: mark that this escalation became a real
+            # ticket. Without this, the row stays response_source='escalated'
+            # with no plain_thread_id and "tickets created" undercounts.
+            if row_id and plain_thread_id:
+                await db.update_conversation_ticket(row_id, plain_thread_id)
+
             log.info(f"User confirmed ticket for pending escalation: {message.author}")
             return True
 
         if is_no:
             del self._pending_escalations[key]
+            self._pending_row_ids.pop(key, None)
             await message.reply(
                 "No problem! Feel free to come back if anything changes. 👋",
                 mention_author=False,
@@ -816,6 +847,7 @@ Choose the single best-fit value from this fixed list ONLY:
 
         # Ambiguous reply — clear pending (they moved on) and let normal flow handle it
         del self._pending_escalations[key]
+        self._pending_row_ids.pop(key, None)
         return False
 
     # ── Ticket Thread Message Handling ─────────────────────────────────────
@@ -1141,7 +1173,7 @@ Choose the single best-fit value from this fixed list ONLY:
         # dashboard counts these separately from doc answers; resolved_by_bot
         # is True (the user got a definitive answer) unless the override is
         # one that also offers a ticket, in which case it's an escalation path.
-        asyncio.ensure_future(db.log_conversation(
+        override_log_kwargs = dict(
             source="discord",
             user_id=str(message.author.id),
             username=message.author.display_name,
@@ -1153,7 +1185,16 @@ Choose the single best-fit value from this fixed list ONLY:
             doc_gap=False,
             override_id=override["id"],
             llm_provider=None,   # overrides bypass the LLM entirely
-        ))
+        )
+        if override.get("allow_ticket_offer"):
+            # Mode B set a pending escalation — capture this row's id so a
+            # later "yes" can backfill plain_thread_id onto it.
+            key = (message.channel.id, message.author.id)
+            row_id = await db.log_conversation(**override_log_kwargs)
+            if row_id:
+                self._pending_row_ids[key] = row_id
+        else:
+            asyncio.ensure_future(db.log_conversation(**override_log_kwargs))
 
         log.info(
             f"Override fired: id={override['id']} name={override.get('name')!r} "
@@ -1282,10 +1323,16 @@ Choose the single best-fit value from this fixed list ONLY:
                     await message.channel.send(chunk)
 
         # ── Stats logging ────────────────────────────────────────────────────
-        # Fire-and-forget — db.log_conversation never raises, but we also don't
-        # want to await it on the user-facing path. A stats write must never
-        # delay or break a support reply.
-        asyncio.ensure_future(db.log_conversation(
+        # db.log_conversation never raises and is a single fast insert.
+        #
+        # Normally fire-and-forget — we don't want to await a stats write on the
+        # user-facing path. BUT if this message just triggered an escalation
+        # offer (_maybe_escalate set _pending_escalations for this key), we need
+        # this row's id so that — if the user later says "yes" and a ticket is
+        # created — we can backfill plain_thread_id onto THIS row. In that one
+        # case we await the insert to capture the id. Escalations are a small
+        # fraction of messages, so the cost is negligible.
+        log_kwargs = dict(
             source="discord",
             user_id=str(message.author.id),
             username=message.author.display_name,
@@ -1300,7 +1347,14 @@ Choose the single best-fit value from this fixed list ONLY:
             tokens_out=tokens_out,
             latency_ms=latency_ms,
             error=(None if llm_ok else "LLM call failed"),
-        ))
+        )
+        if key in self._pending_escalations:
+            # Escalation offer was just made on this message — capture the row id.
+            row_id = await db.log_conversation(**log_kwargs)
+            if row_id:
+                self._pending_row_ids[key] = row_id
+        else:
+            asyncio.ensure_future(db.log_conversation(**log_kwargs))
 
         log.info(f"Responded to {message.author} in #{message.channel.name}")
 

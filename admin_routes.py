@@ -1004,6 +1004,7 @@ async def stats_dashboard(request: Request, _: None = Depends(require_admin)):
     total       = summary.get("total", 0)
     resolved    = summary.get("resolved", 0)
     rate        = summary.get("resolved_rate", 0.0)
+    escalated   = summary.get("escalated", 0)
     tickets     = summary.get("tickets", 0)
     doc_gaps    = summary.get("doc_gaps", 0)
     errors      = summary.get("errors", 0)
@@ -1019,7 +1020,8 @@ async def stats_dashboard(request: Request, _: None = Depends(require_admin)):
     cards = (
         _stat_card("Messages handled", f"{total:,}")
         + _stat_card("Resolved by bot", f"{rate:.0f}%", f"{resolved:,} of {total:,}", tone="yellow")
-        + _stat_card("Escalated to ticket", f"{tickets:,}", tone="orange")
+        + _stat_card("Escalated", f"{escalated:,}", "ticket offered to user", tone="orange")
+        + _stat_card("Tickets created", f"{tickets:,}", "user accepted the offer", tone="orange")
         + _stat_card("Doc gaps", f"{doc_gaps:,}", "answers with no doc match", tone="orange")
         + _stat_card("Errors", f"{errors:,}", tone="orange" if errors else "")
         + _stat_card("Avg response", _fmt_ms(avg_ms), f"p95 {_fmt_ms(p95_ms)}")
