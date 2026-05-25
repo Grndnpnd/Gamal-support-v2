@@ -1144,6 +1144,7 @@ Choose the single best-fit value from this fixed list ONLY:
         asyncio.ensure_future(db.log_conversation(
             source="discord",
             user_id=str(message.author.id),
+            username=message.author.display_name,
             channel_id=str(message.channel.id),
             question=content,
             topic="override",
@@ -1287,6 +1288,7 @@ Choose the single best-fit value from this fixed list ONLY:
         asyncio.ensure_future(db.log_conversation(
             source="discord",
             user_id=str(message.author.id),
+            username=message.author.display_name,
             channel_id=str(message.channel.id),
             question=content,
             topic=topic,

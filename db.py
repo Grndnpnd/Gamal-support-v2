@@ -49,6 +49,7 @@ CREATE TABLE IF NOT EXISTS conversations (
     -- where the interaction came from
     source           TEXT NOT NULL DEFAULT 'discord',   -- 'discord' | 'api'
     user_id          TEXT,                              -- discord user id (string)
+    username         TEXT,                              -- discord display name
     channel_id       TEXT,
 
     -- what was asked
@@ -71,11 +72,17 @@ CREATE TABLE IF NOT EXISTS conversations (
     error            TEXT                               -- error detail if response_source='error'
 );
 
+-- Migration for tables created before the username column existed.
+-- ADD COLUMN IF NOT EXISTS is idempotent — safe to run on every startup.
+ALTER TABLE conversations ADD COLUMN IF NOT EXISTS username TEXT;
+
 -- Indexes for the dashboard queries. started_at drives every time-window
 -- filter; topic and response_source drive the grouping reports.
 CREATE INDEX IF NOT EXISTS idx_conv_started_at      ON conversations (started_at DESC);
 CREATE INDEX IF NOT EXISTS idx_conv_response_source ON conversations (response_source);
 CREATE INDEX IF NOT EXISTS idx_conv_topic           ON conversations (topic);
+CREATE INDEX IF NOT EXISTS idx_conv_user            ON conversations (user_id);
+CREATE INDEX IF NOT EXISTS idx_conv_channel         ON conversations (channel_id);
 """
 
 
@@ -135,6 +142,7 @@ async def log_conversation(
     *,
     source: str = "discord",
     user_id: Optional[str] = None,
+    username: Optional[str] = None,
     channel_id: Optional[str] = None,
     question: Optional[str] = None,
     topic: Optional[str] = None,
@@ -165,16 +173,16 @@ async def log_conversation(
             row = await conn.fetchrow(
                 """
                 INSERT INTO conversations (
-                    source, user_id, channel_id, question, topic,
+                    source, user_id, username, channel_id, question, topic,
                     response_source, resolved_by_bot, doc_gap, override_id,
                     plain_thread_id, llm_provider, tokens_in, tokens_out,
                     latency_ms, error
                 ) VALUES (
-                    $1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15
+                    $1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16
                 )
                 RETURNING id
                 """,
-                source, user_id, channel_id, question, topic,
+                source, user_id, username, channel_id, question, topic,
                 response_source, resolved_by_bot, doc_gap, override_id,
                 plain_thread_id, llm_provider, tokens_in, tokens_out,
                 latency_ms, error,
@@ -371,4 +379,161 @@ async def get_recent(since: datetime, until: datetime, limit: int = 100) -> list
         return [dict(r) for r in rows]
     except Exception as e:
         log.error(f"get_recent failed: {e}")
+        return []
+
+
+async def get_top_users(since: datetime, until: datetime, limit: int = 10) -> list[dict]:
+    """
+    Users with the most interactions in the window — the "who needs the most
+    help" report. Returns username (falls back to a truncated user_id when no
+    username was recorded), interaction count, and how many of those escalated.
+
+    Discord-source rows only — API calls have no user.
+    """
+    if _pool is None:
+        return []
+    try:
+        async with _pool.acquire() as conn:
+            rows = await conn.fetch(
+                """
+                SELECT
+                    COALESCE(
+                        NULLIF(username, ''),
+                        'user ' || right(user_id, 6)
+                    )                                                     AS who,
+                    user_id,
+                    count(*)                                              AS interactions,
+                    count(*) FILTER (WHERE plain_thread_id IS NOT NULL)   AS escalated,
+                    count(*) FILTER (WHERE doc_gap)                        AS doc_gaps
+                FROM conversations
+                WHERE started_at >= $1 AND started_at < $2
+                  AND source = 'discord'
+                  AND user_id IS NOT NULL
+                GROUP BY user_id, username
+                ORDER BY interactions DESC
+                LIMIT $3
+                """,
+                since, until, limit,
+            )
+        return [dict(r) for r in rows]
+    except Exception as e:
+        log.error(f"get_top_users failed: {e}")
+        return []
+
+
+async def get_provider_split(since: datetime, until: datetime) -> list[dict]:
+    """
+    How answers were split across LLM providers — Bankr primary vs the
+    Ollama Cloud fallback. A high ollama_cloud share means Bankr has been
+    flaky and the failover is carrying load.
+    """
+    if _pool is None:
+        return []
+    try:
+        async with _pool.acquire() as conn:
+            rows = await conn.fetch(
+                """
+                SELECT
+                    COALESCE(llm_provider, 'none')  AS provider,
+                    count(*)                        AS count
+                FROM conversations
+                WHERE started_at >= $1 AND started_at < $2
+                GROUP BY llm_provider
+                ORDER BY count DESC
+                """,
+                since, until,
+            )
+        return [dict(r) for r in rows]
+    except Exception as e:
+        log.error(f"get_provider_split failed: {e}")
+        return []
+
+
+async def get_latency_stats(since: datetime, until: datetime) -> dict:
+    """
+    Response-latency summary: average and 95th percentile in milliseconds.
+    p95 is the early-warning signal — if the slow tail grows, the LLM
+    (primary or fallback) is degrading.
+    """
+    if _pool is None:
+        return {}
+    try:
+        async with _pool.acquire() as conn:
+            row = await conn.fetchrow(
+                """
+                SELECT
+                    COALESCE(round(avg(latency_ms)), 0)                            AS avg_ms,
+                    COALESCE(percentile_cont(0.95) WITHIN GROUP (
+                        ORDER BY latency_ms), 0)                                   AS p95_ms,
+                    COALESCE(max(latency_ms), 0)                                   AS max_ms
+                FROM conversations
+                WHERE started_at >= $1 AND started_at < $2
+                  AND latency_ms IS NOT NULL
+                """,
+                since, until,
+            )
+        return {
+            "avg_ms": int(row["avg_ms"]),
+            "p95_ms": int(row["p95_ms"]),
+            "max_ms": int(row["max_ms"]),
+        }
+    except Exception as e:
+        log.error(f"get_latency_stats failed: {e}")
+        return {}
+
+
+async def get_busiest_hours(since: datetime, until: datetime) -> list[dict]:
+    """
+    Message volume by hour-of-day (0-23, UTC), summed across the window.
+    Tells you when support load peaks so staffing can match it.
+    Always returns 24 rows, zero-filled, so the chart has a full day.
+    """
+    if _pool is None:
+        return [{"hour": h, "count": 0} for h in range(24)]
+    try:
+        async with _pool.acquire() as conn:
+            rows = await conn.fetch(
+                """
+                SELECT
+                    EXTRACT(HOUR FROM started_at)::int  AS hour,
+                    count(*)                            AS count
+                FROM conversations
+                WHERE started_at >= $1 AND started_at < $2
+                GROUP BY hour
+                """,
+                since, until,
+            )
+        counts = {r["hour"]: r["count"] for r in rows}
+        return [{"hour": h, "count": counts.get(h, 0)} for h in range(24)]
+    except Exception as e:
+        log.error(f"get_busiest_hours failed: {e}")
+        return [{"hour": h, "count": 0} for h in range(24)]
+
+
+async def get_busiest_channels(since: datetime, until: datetime, limit: int = 8) -> list[dict]:
+    """
+    Discord channels with the most support traffic in the window.
+    Returns the raw channel_id — the dashboard renders it as a <#id> mention
+    style; Discord clients resolve those to names.
+    """
+    if _pool is None:
+        return []
+    try:
+        async with _pool.acquire() as conn:
+            rows = await conn.fetch(
+                """
+                SELECT channel_id, count(*) AS count
+                FROM conversations
+                WHERE started_at >= $1 AND started_at < $2
+                  AND source = 'discord'
+                  AND channel_id IS NOT NULL
+                GROUP BY channel_id
+                ORDER BY count DESC
+                LIMIT $3
+                """,
+                since, until, limit,
+            )
+        return [dict(r) for r in rows]
+    except Exception as e:
+        log.error(f"get_busiest_channels failed: {e}")
         return []
