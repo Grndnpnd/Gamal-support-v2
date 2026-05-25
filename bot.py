@@ -32,6 +32,7 @@ from redis_map import (
 )
 from redis_overrides import find_matching_override, record_override_hit
 from redis_settings import get_settings
+from redis_pubsub import listen_for_reindex, set_reindex_status
 import db
 
 load_dotenv()
@@ -460,6 +461,26 @@ class BankrSupportBot(discord.Client):
 
         await self.docs.ensure_ready()
         asyncio.ensure_future(self._cleanup_loop())
+        # Listen for manual docs re-index signals from the admin panel.
+        asyncio.ensure_future(listen_for_reindex(self._on_reindex_signal))
+
+    async def _on_reindex_signal(self, triggered_by: str):
+        """
+        Callback for the admin panel's manual docs re-index button. Reports
+        status to Redis so the panel can show this service's progress, then
+        rebuilds the docs index.
+        """
+        await set_reindex_status("bot", "running", detail=f"by {triggered_by}")
+        try:
+            ok = await self.docs.force_reindex()
+            await set_reindex_status(
+                "bot",
+                "done" if ok else "failed",
+                detail="" if ok else "fetch or index failed",
+            )
+        except Exception as e:
+            log.error(f"Bot reindex failed: {e}")
+            await set_reindex_status("bot", "failed", detail=str(e)[:120])
 
     async def _cleanup_loop(self):
         # The loop ticks every 300s. Pruning old stats rows only needs to run

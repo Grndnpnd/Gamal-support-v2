@@ -41,6 +41,7 @@ from redis_overrides import (
     update_override,
 )
 from redis_settings import get_settings, update_settings
+from redis_pubsub import request_reindex, get_reindex_statuses, KNOWN_SERVICES
 import db
 
 log = logging.getLogger(__name__)
@@ -488,6 +489,32 @@ def _esc(s: Optional[str]) -> str:
     )
 
 
+def _relative_time(iso_str: Optional[str]) -> str:
+    """
+    Turn an ISO-8601 timestamp into a human 'x minutes ago' string for the
+    re-index status readout. Returns 'unknown' if the value can't be parsed.
+    """
+    if not iso_str:
+        return "unknown"
+    try:
+        then = datetime.fromisoformat(iso_str)
+        if then.tzinfo is None:
+            then = then.replace(tzinfo=timezone.utc)
+        delta = datetime.now(timezone.utc) - then
+        secs = int(delta.total_seconds())
+        if secs < 0:
+            return "just now"
+        if secs < 60:
+            return f"{secs}s ago"
+        if secs < 3600:
+            return f"{secs // 60}m ago"
+        if secs < 86400:
+            return f"{secs // 3600}h ago"
+        return f"{secs // 86400}d ago"
+    except (ValueError, TypeError):
+        return "unknown"
+
+
 # ─── Login / Logout ───────────────────────────────────────────────────────────
 
 @router.get("/login", response_class=HTMLResponse)
@@ -619,11 +646,68 @@ async def dashboard(_: None = Depends(require_admin)):
         if busy_on else '<span class="pill off">busy mode off</span>'
     )
 
+    # ── Docs re-index panel state ────────────────────────────────────────────
+    reindex_statuses = await get_reindex_statuses()
+    reindex_rows = []
+    any_running = False
+    for svc in KNOWN_SERVICES:
+        st = reindex_statuses.get(svc)
+        if not st:
+            pill = '<span class="pill off">no data</span>'
+            when = "never re-indexed via panel"
+        else:
+            state = st.get("state", "unknown")
+            when = _relative_time(st.get("at"))
+            if state == "running":
+                any_running = True
+                pill = '<span class="pill warn">re-indexing…</span>'
+                when = f"started {when}"
+            elif state == "done":
+                pill = '<span class="pill on">up to date</span>'
+                when = f"finished {when}"
+            elif state == "failed":
+                pill = '<span class="pill danger-pill">failed</span>'
+                detail = st.get("detail", "")
+                when = f"failed {when}" + (f" — {_esc(detail)}" if detail else "")
+            else:
+                pill = '<span class="pill off">unknown</span>'
+        reindex_rows.append(f"""
+          <tr>
+            <td><strong>{_esc(svc)}</strong> service</td>
+            <td>{pill}</td>
+            <td class="hint">{when}</td>
+          </tr>
+        """)
+    reindex_table = f"""
+      <table>
+        <thead><tr><th>Service</th><th>Status</th><th>Last re-index</th></tr></thead>
+        <tbody>{''.join(reindex_rows)}</tbody>
+      </table>
+    """
+    reindex_btn_label = "Re-indexing…" if any_running else "Re-pull &amp; re-index docs"
+    reindex_btn_attr = "disabled" if any_running else ""
+
     body = f"""
     <h2>Bot Controls</h2>
     <p class="dim">
       Operational toggles and response overrides for the Gamal support bot.
     </p>
+
+    <div class="panel">
+      <h3>Documentation index</h3>
+      <p class="dim">
+        Re-pull the docs from source and rebuild the search index on both the
+        <strong>bot</strong> and <strong>api</strong> services. Use this after
+        updating the docs so changes take effect immediately, instead of
+        waiting for the scheduled refresh or a redeploy. Re-indexing takes up
+        to a minute per service; the old index keeps answering until the new
+        one is ready, so there's no downtime.
+      </p>
+      {reindex_table}
+      <form method="POST" action="/admin/reindex" style="margin-top:16px;">
+        <button type="submit" {reindex_btn_attr}>{reindex_btn_label}</button>
+      </form>
+    </div>
 
     <div class="panel">
       <h3>Busy mode &nbsp; {busy_status_pill}</h3>
@@ -720,6 +804,21 @@ async def settings_busy_mode(
         busy_mode_enabled=bool(busy_mode_enabled),
         busy_mode_roles=roles,
     )
+    return RedirectResponse("/admin", status_code=303)
+
+
+@router.post("/reindex")
+async def trigger_reindex(request: Request, _: None = Depends(require_admin)):
+    """
+    Manually trigger a docs re-index across all services.
+
+    Publishes a signal via Redis pub/sub; the bot and api services each pick
+    it up and rebuild their own index, reporting status back. This route
+    returns immediately — it does not wait for the re-index to finish. The
+    Controls page status table reflects progress on refresh.
+    """
+    _check_csrf(request)
+    await request_reindex(triggered_by="admin panel")
     return RedirectResponse("/admin", status_code=303)
 
 

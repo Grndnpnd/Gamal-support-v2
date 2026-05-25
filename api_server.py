@@ -39,6 +39,7 @@ import uvicorn
 
 from shared import SemanticDocsManager, OllamaClient
 from llm_router import LLMRouter
+from redis_pubsub import listen_for_reindex, set_reindex_status
 import db
 
 load_dotenv()
@@ -68,8 +69,25 @@ async def lifespan(app: FastAPI):
     await docs.ensure_ready()
     log.info("Docs ready.")
     await db.init_db()  # no-op if DATABASE_URL is unset
+
+    # Listen for manual docs re-index signals from the admin panel.
+    async def _on_reindex_signal(triggered_by: str):
+        await set_reindex_status("api", "running", detail=f"by {triggered_by}")
+        try:
+            ok = await docs.force_reindex()
+            await set_reindex_status(
+                "api", "done" if ok else "failed",
+                detail="" if ok else "fetch or index failed",
+            )
+        except Exception as e:
+            log.error(f"API reindex failed: {e}")
+            await set_reindex_status("api", "failed", detail=str(e)[:120])
+
+    reindex_task = asyncio.ensure_future(listen_for_reindex(_on_reindex_signal))
+
     yield
     # shutdown
+    reindex_task.cancel()
     await db.close_db()
 
 

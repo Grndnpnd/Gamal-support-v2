@@ -53,6 +53,9 @@ class SemanticDocsManager:
         self.raw_content: str = ""
         self.last_fetched: datetime | None = None
         self._ready: bool = False
+        # True while a re-index is running — lets force_reindex reject a
+        # second concurrent request instead of running two embeds at once.
+        self._reindexing: bool = False
 
         self._client = chromadb.Client()
         self._ef = embedding_functions.SentenceTransformerEmbeddingFunction(
@@ -72,6 +75,36 @@ class SemanticDocsManager:
             or now - self.last_fetched > timedelta(hours=DOCS_REFRESH_HOURS)
         ):
             await self._fetch_and_index()
+
+    async def force_reindex(self) -> bool:
+        """
+        Unconditionally re-fetch the docs from DOCS_URL and rebuild the index,
+        ignoring the DOCS_REFRESH_HOURS timer. Used by the admin panel's manual
+        re-index button so doc changes can take effect without waiting for the
+        refresh cooldown or a redeploy.
+
+        The existing index keeps serving queries until the rebuild swaps it in,
+        so there's no downtime. Returns True on success, False if the fetch or
+        index failed, or if a re-index is already running.
+        """
+        if self._reindexing:
+            log.warning("force_reindex: a re-index is already running — ignoring")
+            return False
+        self._reindexing = True
+        try:
+            log.info("Manual re-index requested — re-fetching docs")
+            before = self.last_fetched
+            await self._fetch_and_index()
+            # _fetch_and_index updates last_fetched only on a successful fetch;
+            # if it didn't move, the re-index failed.
+            ok = self.last_fetched is not None and self.last_fetched != before
+            if ok:
+                log.info("Manual re-index complete")
+            else:
+                log.error("Manual re-index failed — keeping previous index")
+            return ok
+        finally:
+            self._reindexing = False
 
     async def query(self, question: str, top_k: int | None = None) -> str:
         """
