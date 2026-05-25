@@ -21,6 +21,7 @@ sufficient for a single-admin internal tool. If you ever expose this to
 the public internet, add a proper CSRF token.
 """
 
+import asyncio
 import logging
 import os
 import secrets
@@ -40,6 +41,7 @@ from redis_overrides import (
     update_override,
 )
 from redis_settings import get_settings, update_settings
+import db
 
 log = logging.getLogger(__name__)
 
@@ -261,16 +263,65 @@ _BASE_STYLE = """
   }
   .flash.error { background: rgba(232,85,85,0.15); border: 1px solid rgba(232,85,85,0.4); color: #ffb0b0; }
   .empty { text-align: center; padding: 40px; color: var(--text-dim); }
+
+  /* ── Stats dashboard ── */
+  .pill.danger-pill { background: rgba(232,85,85,0.18); color: var(--danger); }
+  .stat-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(160px, 1fr));
+    gap: 14px;
+    margin-bottom: 24px;
+  }
+  .stat-card {
+    background: var(--panel);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 18px;
+  }
+  .stat-value { font-size: 28px; font-weight: 700; color: var(--text); }
+  .stat-label { font-size: 13px; color: var(--text-dim); margin-top: 2px; }
+  .stat-sub   { font-size: 11px; color: var(--text-dim); margin-top: 4px; }
+  .chart-wrap { position: relative; height: 280px; margin-top: 8px; }
+  .controls {
+    display: flex; flex-wrap: wrap; gap: 16px;
+    align-items: center; justify-content: space-between;
+    margin-bottom: 24px;
+  }
+  .preset-row { display: flex; gap: 8px; }
+  .rangebtn {
+    padding: 7px 14px;
+    border-radius: 6px;
+    border: 1px solid var(--border);
+    color: var(--text-dim);
+    text-decoration: none;
+    font-size: 13px;
+  }
+  .rangebtn:hover { color: var(--text); }
+  .rangebtn.active {
+    background: var(--accent);
+    color: #0a0c12;
+    border-color: var(--accent);
+    font-weight: 600;
+  }
+  .range-form { display: flex; gap: 8px; align-items: center; }
+  .range-form input[type=datetime-local] { width: auto; }
+  code {
+    background: var(--panel-2);
+    padding: 2px 6px;
+    border-radius: 4px;
+    font-size: 13px;
+  }
 </style>
 """
 
 
-def _page(title: str, body: str, show_nav: bool = True) -> str:
+def _page(title: str, body: str, show_nav: bool = True, head_extra: str = "") -> str:
     nav = ""
     if show_nav:
         nav = """
         <nav>
-          <a href="/admin">Overrides</a>
+          <a href="/admin">Controls</a>
+          <a href="/admin/stats">Stats</a>
           <a href="/admin/logout">Sign out</a>
         </nav>
         """
@@ -281,6 +332,7 @@ def _page(title: str, body: str, show_nav: bool = True) -> str:
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>{title} — Gamal Admin</title>
   {_BASE_STYLE}
+  {head_extra}
 </head>
 <body>
   <header>
@@ -696,3 +748,370 @@ async def override_delete(
     _check_csrf(request)
     await delete_override(oid)
     return RedirectResponse("/admin", status_code=303)
+
+
+# ─── Stats Dashboard ──────────────────────────────────────────────────────────
+# Reads the conversations table (db.py) and renders headline cards, three
+# Chart.js graphs, and the most-asked / documentation-gap topic table.
+#
+# Time window: supports both fixed presets (24h/7d/30d) via ?range= and an
+# arbitrary date range via ?from=&to=. The arbitrary range takes precedence
+# when both from and to are supplied.
+
+import json as _json
+
+
+def _resolve_window(
+    range_preset: Optional[str],
+    from_str: Optional[str],
+    to_str: Optional[str],
+) -> tuple[datetime, datetime, str, str]:
+    """
+    Work out the [since, until] UTC window for the dashboard.
+
+    Returns (since, until, bucket, label) where:
+      bucket - 'hour' or 'day', chosen so charts have a sensible resolution
+      label  - human description of the active window, shown in the UI
+
+    Precedence: an explicit from+to wins; otherwise the preset; default 7d.
+    """
+    now = datetime.now(timezone.utc)
+
+    # Arbitrary range — both bounds required
+    if from_str and to_str:
+        try:
+            since = datetime.fromisoformat(from_str).replace(tzinfo=timezone.utc)
+            until = datetime.fromisoformat(to_str).replace(tzinfo=timezone.utc)
+            if until <= since:
+                raise ValueError("end before start")
+            span_hours = (until - since).total_seconds() / 3600
+            bucket = "hour" if span_hours <= 48 else "day"
+            label = f"{since:%Y-%m-%d %H:%M} → {until:%Y-%m-%d %H:%M} UTC"
+            return since, until, bucket, label
+        except ValueError:
+            # fall through to preset on a bad custom range
+            pass
+
+    preset = (range_preset or "7d").lower()
+    if preset == "24h":
+        return now - timedelta(hours=24), now, "hour", "Last 24 hours"
+    if preset == "30d":
+        return now - timedelta(days=30), now, "day", "Last 30 days"
+    # default / "7d"
+    return now - timedelta(days=7), now, "day", "Last 7 days"
+
+
+def _stat_card(label: str, value: str, sub: str = "") -> str:
+    sub_html = f'<div class="stat-sub">{_esc(sub)}</div>' if sub else ""
+    return f"""
+      <div class="stat-card">
+        <div class="stat-value">{_esc(value)}</div>
+        <div class="stat-label">{_esc(label)}</div>
+        {sub_html}
+      </div>
+    """
+
+
+@router.get("/stats", response_class=HTMLResponse)
+async def stats_dashboard(request: Request, _: None = Depends(require_admin)):
+    """
+    The analytics dashboard. Query params:
+      ?range=24h|7d|30d         fixed preset
+      ?from=ISO&to=ISO          arbitrary UTC range (overrides preset)
+
+    'from' is a Python keyword so we can't bind it as a function parameter —
+    query params are read directly off the Request instead.
+    """
+    qp = request.query_params
+    since, until, bucket, label = _resolve_window(
+        qp.get("range"), qp.get("from"), qp.get("to")
+    )
+
+    # If stats logging isn't even enabled, say so plainly rather than showing
+    # a dashboard full of zeroes that looks like a bug.
+    if not db.is_enabled():
+        body = """
+        <h2>Stats</h2>
+        <div class="panel">
+          <div class="empty">
+            Stats database not connected. Set <code>DATABASE_URL</code> on the
+            api service and redeploy — see deploy notes.
+          </div>
+        </div>
+        """
+        return HTMLResponse(_page("Stats", body))
+
+    # Fetch everything in parallel — four independent queries.
+    summary, series, topics, recent = await asyncio.gather(
+        db.get_summary(since, until),
+        db.get_timeseries(since, until, bucket=bucket),
+        db.get_top_topics(since, until, limit=25),
+        db.get_recent(since, until, limit=50),
+    )
+
+    # ── Headline cards ───────────────────────────────────────────────────────
+    total       = summary.get("total", 0)
+    resolved    = summary.get("resolved", 0)
+    rate        = summary.get("resolved_rate", 0.0)
+    tickets     = summary.get("tickets", 0)
+    doc_gaps    = summary.get("doc_gaps", 0)
+    errors      = summary.get("errors", 0)
+    tok_in      = summary.get("tokens_in", 0)
+    tok_out     = summary.get("tokens_out", 0)
+    tok_total   = tok_in + tok_out
+
+    cards = (
+        _stat_card("Messages handled", f"{total:,}")
+        + _stat_card("Resolved by bot", f"{rate:.0f}%", f"{resolved:,} of {total:,}")
+        + _stat_card("Escalated to ticket", f"{tickets:,}")
+        + _stat_card("Doc gaps", f"{doc_gaps:,}", "answers with no doc match")
+        + _stat_card("Errors", f"{errors:,}")
+        + _stat_card("Tokens used", f"{tok_total:,}", f"{tok_in:,} in / {tok_out:,} out")
+    )
+
+    # ── Chart data — serialize series for Chart.js ──────────────────────────
+    # Labels: hour buckets show time, day buckets show date.
+    def _fmt_bucket(dt: datetime) -> str:
+        return dt.strftime("%m-%d %H:%M") if bucket == "hour" else dt.strftime("%Y-%m-%d")
+
+    chart_labels   = [_fmt_bucket(r["bucket"]) for r in series]
+    msg_totals     = [r["total"] for r in series]
+    docs_series    = [r["docs"] for r in series]
+    override_ser   = [r["override"] for r in series]
+    fallback_ser   = [r["fallback"] for r in series]
+    escalated_ser  = [r["escalated"] for r in series]
+    unresolved_ser = [r["unresolved"] for r in series]
+    error_ser      = [r["error"] for r in series]
+    tokin_series   = [r["tokens_in"] for r in series]
+    tokout_series  = [r["tokens_out"] for r in series]
+
+    chart_data = _json.dumps({
+        "labels": chart_labels,
+        "msgTotals": msg_totals,
+        "docs": docs_series,
+        "override": override_ser,
+        "fallback": fallback_ser,
+        "escalated": escalated_ser,
+        "unresolved": unresolved_ser,
+        "error": error_ser,
+        "tokensIn": tokin_series,
+        "tokensOut": tokout_series,
+    })
+
+    # ── Topics table (most-asked / doc-gap report) ──────────────────────────
+    if topics:
+        topic_rows = []
+        for t in topics:
+            asked     = t["asked"]
+            gaps      = t["doc_gaps"]
+            resolved_t = t["resolved"]
+            escalated_t = t["escalated"]
+            gap_rate  = (100 * gaps / asked) if asked else 0
+            # Highlight topics with a high doc-gap rate — these are the
+            # documentation holes worth filling.
+            gap_pill = ""
+            if gaps > 0 and gap_rate >= 25:
+                gap_pill = f'<span class="pill warn">{gap_rate:.0f}% gap</span>'
+            elif gaps > 0:
+                gap_pill = f'<span class="pill off">{gap_rate:.0f}% gap</span>'
+            topic_rows.append(f"""
+              <tr>
+                <td><strong>{_esc(t['topic'])}</strong></td>
+                <td>{asked:,}</td>
+                <td>{resolved_t:,}</td>
+                <td>{escalated_t:,}</td>
+                <td>{gaps:,} {gap_pill}</td>
+              </tr>
+            """)
+        topics_table = f"""
+          <table>
+            <thead>
+              <tr><th>Topic</th><th>Asked</th><th>Resolved</th><th>Escalated</th><th>Doc gaps</th></tr>
+            </thead>
+            <tbody>{''.join(topic_rows)}</tbody>
+          </table>
+        """
+    else:
+        topics_table = '<div class="empty">No conversations recorded in this window yet.</div>'
+
+    # ── Recent activity table ────────────────────────────────────────────────
+    if recent:
+        recent_rows = []
+        for r in recent:
+            ts = r["started_at"].strftime("%m-%d %H:%M")
+            q = (r["question"] or "")[:80]
+            rs = r["response_source"] or ""
+            rs_class = {
+                "docs": "on", "override": "warn", "escalated": "warn",
+                "error": "danger-pill", "unresolved": "off", "fallback": "warn",
+            }.get(rs, "off")
+            err = f' <span class="hint">{_esc(r["error"])}</span>' if r.get("error") else ""
+            recent_rows.append(f"""
+              <tr>
+                <td class="hint">{ts}</td>
+                <td>{_esc(q)}</td>
+                <td>{_esc(r.get('topic') or '—')}</td>
+                <td><span class="pill {rs_class}">{_esc(rs)}</span>{err}</td>
+                <td class="hint">{_esc(r.get('llm_provider') or '—')}</td>
+                <td class="hint">{(r.get('tokens_in') or 0) + (r.get('tokens_out') or 0):,}</td>
+              </tr>
+            """)
+        recent_table = f"""
+          <table>
+            <thead>
+              <tr><th>Time</th><th>Question</th><th>Topic</th><th>Outcome</th><th>Provider</th><th>Tokens</th></tr>
+            </thead>
+            <tbody>{''.join(recent_rows)}</tbody>
+          </table>
+        """
+    else:
+        recent_table = '<div class="empty">No activity in this window yet.</div>'
+
+    # ── Time-range controls ──────────────────────────────────────────────────
+    def _preset_btn(key: str, text: str) -> str:
+        active = "active" if (qp.get("range") == key and not (qp.get("from") and qp.get("to"))) else ""
+        # default 7d is active when no params at all
+        if not qp.get("range") and not (qp.get("from") and qp.get("to")) and key == "7d":
+            active = "active"
+        return f'<a class="rangebtn {active}" href="/admin/stats?range={key}">{text}</a>'
+
+    controls = f"""
+      <div class="controls">
+        <div class="preset-row">
+          {_preset_btn("24h", "24 hours")}
+          {_preset_btn("7d", "7 days")}
+          {_preset_btn("30d", "30 days")}
+        </div>
+        <form method="GET" action="/admin/stats" class="range-form">
+          <input type="datetime-local" name="from" required>
+          <span class="hint">to</span>
+          <input type="datetime-local" name="to" required>
+          <button type="submit" class="secondary">Apply range</button>
+        </form>
+      </div>
+    """
+
+    # ── Chart.js — loaded from CDN, init script at end ──────────────────────
+    head_extra = '<script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.1/chart.umd.min.js"></script>'
+
+    chart_script = f"""
+    <script>
+      const D = {chart_data};
+      const gridColor = 'rgba(255,255,255,0.06)';
+      const tickColor = '#8b92a3';
+      Chart.defaults.color = tickColor;
+      Chart.defaults.font.family = "-apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif";
+
+      // 1. Messages over time
+      new Chart(document.getElementById('msgChart'), {{
+        type: 'line',
+        data: {{
+          labels: D.labels,
+          datasets: [{{
+            label: 'Messages',
+            data: D.msgTotals,
+            borderColor: '#7c9eff',
+            backgroundColor: 'rgba(124,158,255,0.12)',
+            fill: true, tension: 0.3, pointRadius: 2,
+          }}]
+        }},
+        options: {{
+          responsive: true, maintainAspectRatio: false,
+          plugins: {{ legend: {{ display: false }} }},
+          scales: {{
+            x: {{ grid: {{ color: gridColor }} }},
+            y: {{ grid: {{ color: gridColor }}, beginAtZero: true }}
+          }}
+        }}
+      }});
+
+      // 2. Resolution breakdown — stacked bar
+      new Chart(document.getElementById('resChart'), {{
+        type: 'bar',
+        data: {{
+          labels: D.labels,
+          datasets: [
+            {{ label: 'Docs',       data: D.docs,       backgroundColor: '#4caf78' }},
+            {{ label: 'Override',   data: D.override,   backgroundColor: '#7c9eff' }},
+            {{ label: 'Fallback',   data: D.fallback,   backgroundColor: '#5577dd' }},
+            {{ label: 'Escalated',  data: D.escalated,  backgroundColor: '#d4a44a' }},
+            {{ label: 'Unresolved', data: D.unresolved, backgroundColor: '#8b92a3' }},
+            {{ label: 'Error',      data: D.error,      backgroundColor: '#e85555' }},
+          ]
+        }},
+        options: {{
+          responsive: true, maintainAspectRatio: false,
+          plugins: {{ legend: {{ position: 'bottom' }} }},
+          scales: {{
+            x: {{ stacked: true, grid: {{ color: gridColor }} }},
+            y: {{ stacked: true, grid: {{ color: gridColor }}, beginAtZero: true }}
+          }}
+        }}
+      }});
+
+      // 3. Token usage over time
+      new Chart(document.getElementById('tokChart'), {{
+        type: 'line',
+        data: {{
+          labels: D.labels,
+          datasets: [
+            {{ label: 'Tokens in',  data: D.tokensIn,  borderColor: '#7c9eff',
+               backgroundColor: 'rgba(124,158,255,0.10)', fill: true, tension: 0.3, pointRadius: 2 }},
+            {{ label: 'Tokens out', data: D.tokensOut, borderColor: '#4caf78',
+               backgroundColor: 'rgba(76,175,120,0.10)', fill: true, tension: 0.3, pointRadius: 2 }},
+          ]
+        }},
+        options: {{
+          responsive: true, maintainAspectRatio: false,
+          plugins: {{ legend: {{ position: 'bottom' }} }},
+          scales: {{
+            x: {{ grid: {{ color: gridColor }} }},
+            y: {{ grid: {{ color: gridColor }}, beginAtZero: true }}
+          }}
+        }}
+      }});
+    </script>
+    """
+
+    body = f"""
+    <h2>Stats</h2>
+    <p class="dim">Showing: <strong>{_esc(label)}</strong></p>
+
+    {controls}
+
+    <div class="stat-grid">
+      {cards}
+    </div>
+
+    <div class="panel">
+      <h3>Messages over time</h3>
+      <div class="chart-wrap"><canvas id="msgChart"></canvas></div>
+    </div>
+
+    <div class="panel">
+      <h3>Resolution breakdown</h3>
+      <p class="dim">How each message was handled. A growing escalated/error
+      slice is the early warning that something needs attention.</p>
+      <div class="chart-wrap"><canvas id="resChart"></canvas></div>
+    </div>
+
+    <div class="panel">
+      <h3>Token usage</h3>
+      <div class="chart-wrap"><canvas id="tokChart"></canvas></div>
+    </div>
+
+    <div class="panel">
+      <h3>Most-asked topics &amp; documentation gaps</h3>
+      <p class="dim">Topics ranked by volume. A high doc-gap rate flags
+      questions the docs don't answer well — the list of things worth writing.</p>
+      {topics_table}
+    </div>
+
+    <div class="panel">
+      <h3>Recent activity</h3>
+      {recent_table}
+    </div>
+
+    {chart_script}
+    """
+    return HTMLResponse(_page("Stats", body, head_extra=head_extra))
