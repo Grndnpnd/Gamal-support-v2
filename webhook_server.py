@@ -147,27 +147,105 @@ def cancel_thread_deletion(discord_thread_id: int) -> bool:
 
 
 # ─── Idempotency cache ───────────────────────────────────────────────────────
-# Tracks recently relayed Plain event IDs to prevent duplicate posts.
-# Plain may retry webhooks if it doesn't receive a timely 200 response.
-# Uses a simple bounded set — old IDs are evicted once the set exceeds the limit.
-_relayed_event_ids: set[str] = set()
-_MAX_RELAYED_IDS = 500
+# ─── Webhook idempotency ──────────────────────────────────────────────────────
+#
+# Plain delivers webhooks "at least once" — it retries if it doesn't get a
+# timely 200, and a retry can arrive long after the original (observed: ~90
+# minutes later, across a service redeploy). Without dedupe, a retry of an
+# already-handled event posts the agent's reply to Discord a second time.
+#
+# Dedupe MUST be backed by Redis, not an in-memory set: the webhook service
+# restarts on every deploy, and an in-memory set is wiped on restart — so a
+# retry arriving after a redeploy would not be recognized as a duplicate.
+# Redis is a separate service and survives the redeploy. Keys carry a TTL so
+# they self-expire; no manual eviction needed.
+#
+# If Redis is unavailable, dedupe degrades to "off" (returns not-a-duplicate)
+# rather than blocking webhook processing — a rare double-post is better than
+# dropping agent replies entirely.
+
+import redis.asyncio as aioredis
+
+REDIS_URL = os.getenv("REDIS_URL", "")
+# How long a processed event ID is remembered. Must comfortably exceed Plain's
+# longest retry window — 7 days is generous and the data (just IDs) is tiny.
+_DEDUPE_TTL_SECONDS = 7 * 86400
+_DEDUPE_KEY_PREFIX = "webhook:seen:"
+
+_dedupe_redis = None
 
 
-def _already_relayed(event_id: str) -> bool:
-    """Return True if this event has already been relayed to Discord."""
-    return event_id in _relayed_event_ids
+def _get_dedupe_redis():
+    """Lazy-init Redis client for webhook dedupe. None if REDIS_URL unset."""
+    global _dedupe_redis
+    if _dedupe_redis is not None:
+        return _dedupe_redis
+    if not REDIS_URL:
+        return None
+    try:
+        _dedupe_redis = aioredis.from_url(
+            REDIS_URL,
+            decode_responses=True,
+            socket_connect_timeout=5,
+            socket_timeout=5,
+        )
+        return _dedupe_redis
+    except Exception as e:
+        log.error(f"Webhook dedupe: Redis connection failed: {e}")
+        return None
 
 
-def _mark_relayed(event_id: str):
-    """Record that this event has been relayed. Evict oldest if over limit."""
-    global _relayed_event_ids
-    if len(_relayed_event_ids) >= _MAX_RELAYED_IDS:
-        # Evict half the set — simple but effective for this use case
-        evict = list(_relayed_event_ids)[:_MAX_RELAYED_IDS // 2]
-        for e in evict:
-            _relayed_event_ids.discard(e)
-    _relayed_event_ids.add(event_id)
+async def _already_relayed(event_id: str) -> bool:
+    """
+    Return True if this Plain event has already been processed (read-only).
+
+    This is a pure check — it does NOT claim the event. Claiming happens in
+    _mark_relayed, called only once the event has actually been handled
+    (posted to Discord, or deliberately skipped). Keeping check and claim
+    separate matters: an event that bails early because no Discord thread is
+    mapped yet must NOT be marked seen — Plain may retry it later once the
+    thread exists, and that retry needs to go through.
+
+    On any Redis error, returns False (treat as not-duplicate) so webhook
+    processing is never blocked by a dedupe-store outage.
+    """
+    if not event_id:
+        return False
+    r = _get_dedupe_redis()
+    if r is None:
+        return False  # dedupe unavailable — process the event
+    try:
+        return await r.exists(f"{_DEDUPE_KEY_PREFIX}{event_id}") == 1
+    except Exception as e:
+        log.error(f"Webhook dedupe check failed for {event_id}: {e} — processing anyway")
+        return False
+
+
+async def _mark_relayed(event_id: str):
+    """
+    Record that this event has been fully handled, so a later Plain retry of
+    the same event is recognized as a duplicate and skipped.
+
+    Called only after a real outcome — a successful Discord post, or a
+    deliberate skip (echo-loop / customer event). NOT called when the handler
+    bails early on a missing thread mapping, so such events stay eligible for
+    a future retry once the mapping exists.
+
+    Best-effort: a Redis failure here just means a future retry might
+    double-post, which is acceptable.
+    """
+    if not event_id:
+        return
+    r = _get_dedupe_redis()
+    if r is None:
+        return
+    try:
+        await r.set(
+            f"{_DEDUPE_KEY_PREFIX}{event_id}", "1",
+            ex=_DEDUPE_TTL_SECONDS,
+        )
+    except Exception as e:
+        log.error(f"Webhook dedupe mark failed for {event_id}: {e}")
 
 
 # ─── Signature Verification ──────────────────────────────────────────────────
@@ -247,8 +325,9 @@ async def handle_plain_webhook(request: web.Request) -> web.Response:
     event_id   = body.get("id", "")
     log.info(f"Plain webhook received: {event_type} (id={event_id})")
 
-    # Deduplication — Plain retries webhooks if it doesn't get a timely 200
-    if event_id and _already_relayed(event_id):
+    # Deduplication — Plain retries webhooks if it doesn't get a timely 200,
+    # and retries survive service redeploys. Redis-backed; see _already_relayed.
+    if event_id and await _already_relayed(event_id):
         log.info(f"Duplicate event {event_id} — already relayed, skipping")
         return web.Response(status=200, text="OK")
 
@@ -339,9 +418,11 @@ async def handle_plain_webhook(request: web.Request) -> web.Response:
         log.warning(f"No Discord thread mapped for Plain thread {thread_id}")
         return web.Response(status=200, text="OK")
 
-    # Mark as relayed before posting so retries are caught even if posting is slow
+    # Mark as relayed before posting so retries are caught even if posting is
+    # slow. Placed AFTER the thread-mapping check above, so an event that
+    # couldn't be mapped is left unmarked and a later retry can still land.
     if event_id:
-        _mark_relayed(event_id)
+        await _mark_relayed(event_id)
 
     # Resolve agent name from createdBy.user (Plain's structure for user actors)
     thread_obj = payload.get("thread", {}) or {}
