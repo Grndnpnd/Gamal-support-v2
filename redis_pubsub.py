@@ -27,6 +27,7 @@ Redis keys:
   reindex:status:{service}     JSON {state, at, detail} per service
 """
 
+import asyncio
 import json
 import logging
 import os
@@ -47,7 +48,15 @@ _redis_client = None
 
 
 def _get_redis():
-    """Lazy-init Redis client. Returns None if REDIS_URL not set."""
+    """
+    Lazy-init Redis client for SHORT request/response ops (publish, get, set).
+    Returns None if REDIS_URL not set.
+
+    Note: this client has a 5s socket_timeout, which is a good safety net for
+    quick ops but is WRONG for a pub/sub subscriber — an idle subscriber
+    legitimately reads nothing for long stretches and would hit that timeout.
+    The subscriber uses its own client; see listen_for_reindex.
+    """
     global _redis_client
     if _redis_client is not None:
         return _redis_client
@@ -153,30 +162,70 @@ async def listen_for_reindex(on_signal) -> None:
     Long-running coroutine: subscribes to the reindex channel and calls the
     async `on_signal` callback whenever a re-index is requested.
 
-    Each service starts this once as a background task. If Redis is
-    unavailable it logs and returns (the service still runs, just without
-    the manual-reindex feature).
+    Each service starts this once as a background task. If REDIS_URL is unset
+    it logs and returns (the service still runs, just without manual reindex).
 
-    The callback is responsible for the actual re-index and for reporting
-    status via set_reindex_status.
+    Two things this has to get right that a naive version doesn't:
+
+    1. Its own client with NO socket read timeout. A subscriber spends almost
+       all its time idle, waiting for a publish that may not come for hours.
+       The shared _get_redis() client has socket_timeout=5 — correct for quick
+       ops, fatal here (an idle subscriber would "time out" after 5s and die).
+
+    2. A reconnect loop. Redis connections drop — deploys, network blips,
+       Railway internal hiccups. Without the loop, one drop permanently kills
+       the feature until a redeploy. With it, the subscriber just reconnects
+       after a short backoff and carries on.
     """
-    r = _get_redis()
-    if r is None:
-        log.warning("listen_for_reindex: Redis unavailable — manual reindex disabled")
+    if not REDIS_URL:
+        log.warning("listen_for_reindex: REDIS_URL unset — manual reindex disabled")
         return
 
-    try:
-        pubsub = r.pubsub()
-        await pubsub.subscribe(REINDEX_CHANNEL)
-        log.info("Listening for manual reindex signals")
-        async for message in pubsub.listen():
-            if message.get("type") != "message":
-                continue  # ignore subscribe-confirmation frames
-            triggered_by = message.get("data", "unknown")
-            log.info(f"Reindex signal received (by {triggered_by})")
-            try:
-                await on_signal(triggered_by)
-            except Exception as e:
-                log.error(f"Reindex callback errored: {e}")
-    except Exception as e:
-        log.error(f"listen_for_reindex loop ended: {e}")
+    import redis.asyncio as aioredis
+
+    backoff = 2
+    while True:
+        sub_client = None
+        try:
+            # Dedicated client: socket_timeout=None so idle waiting is fine.
+            sub_client = aioredis.from_url(
+                REDIS_URL,
+                decode_responses=True,
+                socket_connect_timeout=5,
+                socket_timeout=None,
+                health_check_interval=30,
+            )
+            pubsub = sub_client.pubsub()
+            await pubsub.subscribe(REINDEX_CHANNEL)
+            log.info("Listening for manual reindex signals")
+            backoff = 2  # reset backoff after a successful (re)subscribe
+
+            async for message in pubsub.listen():
+                if message.get("type") != "message":
+                    continue  # ignore subscribe-confirmation frames
+                triggered_by = message.get("data", "unknown")
+                log.info(f"Reindex signal received (by {triggered_by})")
+                try:
+                    await on_signal(triggered_by)
+                except Exception as e:
+                    log.error(f"Reindex callback errored: {e}")
+
+        except asyncio.CancelledError:
+            # Service is shutting down — exit cleanly, don't reconnect.
+            log.info("Reindex subscriber cancelled — stopping")
+            raise
+        except Exception as e:
+            log.warning(
+                f"Reindex subscriber connection lost ({e}) — "
+                f"reconnecting in {backoff}s"
+            )
+        finally:
+            if sub_client is not None:
+                try:
+                    await sub_client.aclose()
+                except Exception:
+                    pass
+
+        # Reconnect with capped exponential backoff.
+        await asyncio.sleep(backoff)
+        backoff = min(backoff * 2, 60)
