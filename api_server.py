@@ -39,6 +39,7 @@ import uvicorn
 
 from shared import SemanticDocsManager, OllamaClient
 from llm_router import LLMRouter
+import db
 
 load_dotenv()
 
@@ -62,12 +63,14 @@ ollama = LLMRouter()
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    """Pre-load docs on startup."""
+    """Pre-load docs and init the stats DB on startup."""
     log.info("API server starting — pre-loading docs...")
     await docs.ensure_ready()
     log.info("Docs ready.")
+    await db.init_db()  # no-op if DATABASE_URL is unset
     yield
-    # shutdown — nothing to clean up
+    # shutdown
+    await db.close_db()
 
 
 app = FastAPI(
@@ -246,11 +249,29 @@ async def query_llm(
         )
 
     messages = [{"role": "user", "content": req.question}]
+    _t0 = _time.time()
     answer = await ollama.chat(
         messages=messages,
         system=system,
         temperature=req.temperature or 0.1,
     )
+    _latency_ms = int((_time.time() - _t0) * 1000)
+
+    # Stats row for the agent-API call. source='api' separates these from
+    # Discord traffic in the dashboard. Fire-and-forget — never blocks the response.
+    _llm_ok = getattr(answer, "ok", True)
+    asyncio.ensure_future(db.log_conversation(
+        source="api",
+        question=req.question,
+        topic=None,  # API calls don't run the topic-tagging prompt
+        response_source=("error" if not _llm_ok else "docs"),
+        resolved_by_bot=_llm_ok,
+        llm_provider=getattr(answer, "provider", None),
+        tokens_in=getattr(answer, "tokens_in", 0),
+        tokens_out=getattr(answer, "tokens_out", 0),
+        latency_ms=_latency_ms,
+        error=(None if _llm_ok else "LLM call failed"),
+    ))
 
     return QueryLLMResponse(
         question=req.question,
@@ -298,11 +319,30 @@ async def query_combined(
     )
 
     messages = [{"role": "user", "content": req.question}]
+    _t0 = _time.time()
     answer = await ollama.chat(
         messages=messages,
         system=system,
         temperature=req.temperature or 0.1,
     )
+    _latency_ms = int((_time.time() - _t0) * 1000)
+
+    # Stats row. /query is always grounded, so doc-gap detection applies here.
+    _llm_ok = getattr(answer, "ok", True)
+    _doc_gap = "couldn't find information about that in the Bankr documentation" in answer
+    asyncio.ensure_future(db.log_conversation(
+        source="api",
+        question=req.question,
+        topic=None,
+        response_source=("error" if not _llm_ok else "docs"),
+        resolved_by_bot=_llm_ok,
+        doc_gap=_doc_gap,
+        llm_provider=getattr(answer, "provider", None),
+        tokens_in=getattr(answer, "tokens_in", 0),
+        tokens_out=getattr(answer, "tokens_out", 0),
+        latency_ms=_latency_ms,
+        error=(None if _llm_ok else "LLM call failed"),
+    ))
 
     return QueryLLMResponse(
         question=req.question,

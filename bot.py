@@ -16,6 +16,7 @@ import asyncio
 import aiohttp
 import random
 import re
+import time
 import logging
 from datetime import datetime, timedelta, timezone
 from collections import defaultdict
@@ -31,6 +32,7 @@ from redis_map import (
 )
 from redis_overrides import find_matching_override, record_override_hit
 from redis_settings import get_settings
+import db
 
 load_dotenv()
 
@@ -447,10 +449,18 @@ class BankrSupportBot(discord.Client):
         if self.tickets:
             await self.tickets.load_from_redis()
 
+        # Initialize the stats database (no-op if DATABASE_URL is unset)
+        await db.init_db()
+
         await self.docs.ensure_ready()
         asyncio.ensure_future(self._cleanup_loop())
 
     async def _cleanup_loop(self):
+        # The loop ticks every 300s. Pruning old stats rows only needs to run
+        # ~once a day, so we count ticks: 288 ticks * 300s = 24h.
+        prune_tick = 0
+        PRUNE_EVERY = 288
+
         while True:
             await asyncio.sleep(300)
             self.conversations.cleanup_expired()
@@ -474,6 +484,12 @@ class BankrSupportBot(discord.Client):
                 del self._pending_escalations[k]
             if stale_pending:
                 log.info(f"Cleared {len(stale_pending)} stale pending escalations")
+
+            # Prune stats rows past the retention window, roughly daily.
+            prune_tick += 1
+            if prune_tick >= PRUNE_EVERY:
+                prune_tick = 0
+                await db.prune_old_rows()
 
     # ── Helpers ────────────────────────────────────────────────────────────
 
@@ -518,9 +534,51 @@ Rules:
 - If you are unsure whether to escalate, do not escalate — answer as best you can instead.
 - For partnership/business inquiries: direct them to #partnership-request. Do NOT use either tag for those.
 
+Topic tagging:
+At the very END of your response, after any escalation tag, append exactly one
+topic tag classifying what the user asked about. Format: [TOPIC: <value>]
+Choose the single best-fit value from this fixed list ONLY:
+  dca, swaps, wallet, fees, token-launch, staking, leaderboard, bankr-club,
+  api, openclaw, bridging, airdrop, nft, portfolio, account-access,
+  partnership, greeting, other
+- Use 'greeting' for greetings/thanks/small talk with no real question.
+- Use 'account-access' for login, 401, locked-out, or sign-in problems.
+- Use 'other' ONLY if nothing else fits — do not invent new values.
+- The tag is for internal analytics; the user must never see it. Always
+  include exactly one. Example ending: ...let me know! [TOPIC: dca]
+
 --- RELEVANT BANKR DOCUMENTATION ---
 {relevant_docs}
 --- END DOCUMENTATION ---"""
+
+    # Valid topic values — must match the fixed list in the system prompt.
+    # Anything the model emits outside this set is normalized to 'other' so
+    # the stats GROUP BY stays clean.
+    _VALID_TOPICS = {
+        "dca", "swaps", "wallet", "fees", "token-launch", "staking",
+        "leaderboard", "bankr-club", "api", "openclaw", "bridging",
+        "airdrop", "nft", "portfolio", "account-access", "partnership",
+        "greeting", "other",
+    }
+
+    def _extract_topic(self, response: str) -> tuple[str, str]:
+        """
+        Pull the [TOPIC: x] tag the LLM appends for analytics out of the
+        response. Returns (cleaned_response, topic).
+
+        The tag must never reach the user, so this strips it regardless of
+        whether topic logging is even enabled. If the tag is missing or the
+        value isn't in the fixed vocabulary, topic falls back to 'other'.
+        """
+        topic = "other"
+        match = re.search(r"\[TOPIC:\s*([a-zA-Z\-]+)\s*\]", response, re.IGNORECASE)
+        if match:
+            candidate = match.group(1).strip().lower()
+            if candidate in self._VALID_TOPICS:
+                topic = candidate
+        # Strip the tag (and any leftover whitespace) whether or not it matched
+        cleaned = re.sub(r"\s*\[TOPIC:\s*[a-zA-Z\-]+\s*\]", "", response, flags=re.IGNORECASE).strip()
+        return cleaned, topic
 
     def _was_recently_flagged(self, channel_id: int, user_id: int) -> bool:
         key = (channel_id, user_id)
@@ -1079,6 +1137,23 @@ Rules:
         # caught inside record_override_hit.
         asyncio.ensure_future(record_override_hit(override["id"]))
 
+        # Stats row for the override hit. response_source='override' so the
+        # dashboard counts these separately from doc answers; resolved_by_bot
+        # is True (the user got a definitive answer) unless the override is
+        # one that also offers a ticket, in which case it's an escalation path.
+        asyncio.ensure_future(db.log_conversation(
+            source="discord",
+            user_id=str(message.author.id),
+            channel_id=str(message.channel.id),
+            question=content,
+            topic="override",
+            response_source="override",
+            resolved_by_bot=not override.get("allow_ticket_offer"),
+            doc_gap=False,
+            override_id=override["id"],
+            llm_provider=None,   # overrides bypass the LLM entirely
+        ))
+
         log.info(
             f"Override fired: id={override['id']} name={override.get('name')!r} "
             f"user={message.author} allow_ticket_offer={override.get('allow_ticket_offer')}"
@@ -1128,6 +1203,9 @@ Rules:
 
         self.conversations.add_message(message.channel.id, message.author.id, "user", content)
 
+        key = (message.channel.id, message.author.id)
+        t0 = time.monotonic()
+
         try:
             async with message.channel.typing():
                 relevant_docs = await self.docs.query(content)
@@ -1141,8 +1219,44 @@ Rules:
             history       = self.conversations.get_history(message.channel.id, message.author.id)
             response      = await self.ollama.chat(history, system=system)
 
+        latency_ms = int((time.monotonic() - t0) * 1000)
+
+        # Capture LLM-call metadata from the RAW response now, before any
+        # stripping or concatenation turns it into a plain str and loses the
+        # LLMResponse attributes.
+        llm_provider = getattr(response, "provider", None)
+        tokens_in    = getattr(response, "tokens_in", 0)
+        tokens_out   = getattr(response, "tokens_out", 0)
+        llm_ok       = getattr(response, "ok", True)
+
+        # Doc-gap signal: the grounded system prompt instructs the model to
+        # emit a specific sentence when the docs don't cover the question.
+        # Detecting that exact phrase is how we flag a documentation hole.
+        doc_gap = "couldn't find information about that in the Bankr documentation" in response
+
+        # Pull the analytics topic tag out before the user ever sees the text.
+        response, topic = self._extract_topic(response)
+
+        # Track whether a ticket offer was pending BEFORE _maybe_escalate runs,
+        # so we can tell if this message newly triggered an escalation.
+        had_pending_before = key in self._pending_escalations
+
         # Check for escalation signal from the LLM
         response = await self._maybe_escalate(message, response, content)
+
+        # Classify the outcome for the stats row.
+        #   error      — the LLM call itself failed
+        #   escalated  — this message newly raised an escalation offer
+        #   docs       — a normal grounded answer
+        pending_after = key in self._pending_escalations
+        if not llm_ok:
+            response_source = "error"
+        elif pending_after and not had_pending_before:
+            response_source = "escalated"
+        else:
+            response_source = "docs"
+        # resolved_by_bot: the bot answered and did NOT need to escalate.
+        resolved_by_bot = response_source == "docs"
 
         # Prepend greeting for proactive outreach (single message instead of two)
         if is_proactive:
@@ -1165,6 +1279,26 @@ Rules:
                     await message.reply(chunk, mention_author=False)
                 else:
                     await message.channel.send(chunk)
+
+        # ── Stats logging ────────────────────────────────────────────────────
+        # Fire-and-forget — db.log_conversation never raises, but we also don't
+        # want to await it on the user-facing path. A stats write must never
+        # delay or break a support reply.
+        asyncio.ensure_future(db.log_conversation(
+            source="discord",
+            user_id=str(message.author.id),
+            channel_id=str(message.channel.id),
+            question=content,
+            topic=topic,
+            response_source=response_source,
+            resolved_by_bot=resolved_by_bot,
+            doc_gap=doc_gap,
+            llm_provider=llm_provider,
+            tokens_in=tokens_in,
+            tokens_out=tokens_out,
+            latency_ms=latency_ms,
+            error=(None if llm_ok else "LLM call failed"),
+        ))
 
         log.info(f"Responded to {message.author} in #{message.channel.name}")
 

@@ -9,3 +9,5 @@ redis>=5.0.0
 # Admin panel dependencies (api_server.py /admin/* routes)
 itsdangerous>=2.2.0
 python-multipart>=0.0.9
+# Stats / analytics (db.py — Postgres)
+asyncpg>=0.29.0

@@ -41,6 +41,7 @@ import time
 import aiohttp
 
 from shared import OllamaClient
+from llm_response import LLMResponse
 
 log = logging.getLogger(__name__)
 
@@ -117,11 +118,11 @@ class OllamaCloudClient:
         messages: list[dict],
         system: str = "",
         temperature: float = 0.3,
-    ) -> str:
+    ) -> LLMResponse:
         """
-        Same signature as OllamaClient.chat() so the router can call either
-        interchangeably. Raises on failure (unlike OllamaClient, which
-        returns a friendly string) — the router catches and handles it.
+        Returns an LLMResponse carrying token usage and provider='ollama_cloud'.
+        Raises on failure (unlike OllamaClient, which returns an ok=False
+        LLMResponse) — the router catches and handles it.
         """
         if not self.api_key:
             raise RuntimeError("OLLAMA_CLOUD_KEY not set — fallback unavailable")
@@ -156,11 +157,18 @@ class OllamaCloudClient:
                 data = await resp.json()
 
         # Native Ollama API shape: {"message": {"content": "..."}, ...}
+        # Token counts are prompt_eval_count / eval_count (NOT the OpenAI names).
         message = data.get("message") or {}
         content = message.get("content", "")
         if not content:
             raise RuntimeError(f"Ollama Cloud returned no content: {str(data)[:200]}")
-        return content
+        return LLMResponse(
+            content,
+            provider="ollama_cloud",
+            tokens_in=data.get("prompt_eval_count", 0) or 0,
+            tokens_out=data.get("eval_count", 0) or 0,
+            ok=True,
+        )
 
 
 # ─── Router ───────────────────────────────────────────────────────────────────
@@ -199,16 +207,19 @@ class LLMRouter:
         messages: list[dict],
         system: str = "",
         temperature: float = 0.3,
-    ) -> str:
+    ) -> LLMResponse:
         # ── Attempt 1: Bankr (primary) ───────────────────────────────────────
         try:
             t0 = time.monotonic()
             answer = await self.primary.chat(messages, system=system, temperature=temperature)
-            if not _looks_like_bankr_failure(answer):
+            # answer is an LLMResponse. .ok is False for a swallowed error;
+            # _looks_like_bankr_failure is a belt-and-suspenders text check in
+            # case some path returns a plain string.
+            ok = getattr(answer, "ok", True) and not _looks_like_bankr_failure(answer)
+            if ok:
                 return answer
-            # OllamaClient swallowed an error and returned a friendly string.
             log.warning(
-                f"Bankr primary failed (returned error string after "
+                f"Bankr primary failed (returned error after "
                 f"{time.monotonic() - t0:.1f}s) — falling back to Ollama Cloud"
             )
         except Exception as e:
@@ -217,9 +228,10 @@ class LLMRouter:
         # ── Attempt 2: Ollama Cloud (fallback) ───────────────────────────────
         if not self.fallback.api_key:
             log.error("Bankr failed and no fallback configured — returning degraded message")
-            return (
+            return LLMResponse(
                 "Sorry — our AI assistant is temporarily unavailable. "
-                "Please try again in a little while, or ask a team member for help."
+                "Please try again in a little while, or ask a team member for help.",
+                provider=None, ok=False,
             )
 
         try:
@@ -232,7 +244,8 @@ class LLMRouter:
             return answer
         except Exception as e:
             log.error(f"Fallback also failed ({type(e).__name__}: {e}) — returning degraded message")
-            return (
+            return LLMResponse(
                 "Sorry — our AI assistant is temporarily unavailable. "
-                "Please try again in a little while, or ask a team member for help."
+                "Please try again in a little while, or ask a team member for help.",
+                provider=None, ok=False,
             )

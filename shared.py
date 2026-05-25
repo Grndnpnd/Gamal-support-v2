@@ -17,6 +17,8 @@ import os
 import chromadb
 from chromadb.utils import embedding_functions
 
+from llm_response import LLMResponse
+
 load_dotenv()
 
 log = logging.getLogger(__name__)
@@ -246,7 +248,15 @@ class OllamaClient:
         messages: list[dict],
         system: str = "",
         temperature: float = 0.3,
-    ) -> str:
+    ) -> LLMResponse:
+        """
+        Returns an LLMResponse — a str subclass carrying token usage and
+        provider metadata. Behaves exactly like a str for all existing
+        callers; the stats layer reads .tokens_in / .tokens_out / .provider.
+
+        Error cases return an LLMResponse with ok=False and zero tokens, so
+        the router can distinguish a real answer from a failure.
+        """
         all_messages = []
         if system:
             all_messages.append({"role": "system", "content": system})
@@ -271,19 +281,43 @@ class OllamaClient:
                     if resp.status == 200:
                         data = await resp.json()
                         # OpenAI-compatible response shape
-                        return data["choices"][0]["message"]["content"]
+                        content = data["choices"][0]["message"]["content"]
+                        # usage block is OpenAI-standard: prompt/completion tokens
+                        usage = data.get("usage") or {}
+                        return LLMResponse(
+                            content,
+                            provider="bankr",
+                            tokens_in=usage.get("prompt_tokens", 0) or 0,
+                            tokens_out=usage.get("completion_tokens", 0) or 0,
+                            ok=True,
+                        )
                     elif resp.status == 402:
                         log.error("Bankr LLM Gateway: insufficient credits (402). Top up at bankr.bot/llm")
-                        return "Sorry, the AI backend is temporarily unavailable. Please try again shortly."
+                        return LLMResponse(
+                            "Sorry, the AI backend is temporarily unavailable. Please try again shortly.",
+                            provider="bankr", ok=False,
+                        )
                     elif resp.status == 429:
                         log.warning("Bankr LLM Gateway: rate limited (429)")
-                        return "I'm handling a lot of requests right now — please try again in a moment."
+                        return LLMResponse(
+                            "I'm handling a lot of requests right now — please try again in a moment.",
+                            provider="bankr", ok=False,
+                        )
                     else:
                         text = await resp.text()
                         log.error(f"Bankr LLM Gateway error {resp.status}: {text}")
-                        return "Sorry, I ran into an issue generating a response."
+                        return LLMResponse(
+                            "Sorry, I ran into an issue generating a response.",
+                            provider="bankr", ok=False,
+                        )
         except asyncio.TimeoutError:
-            return "Sorry, the response took too long. Please try again."
+            return LLMResponse(
+                "Sorry, the response took too long. Please try again.",
+                provider="bankr", ok=False,
+            )
         except Exception as e:
             log.error(f"Bankr LLM Gateway request failed: {e}")
-            return "Sorry, I couldn't connect to the AI backend."
+            return LLMResponse(
+                "Sorry, I couldn't connect to the AI backend.",
+                provider="bankr", ok=False,
+            )
