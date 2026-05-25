@@ -693,48 +693,42 @@ async def dashboard(_: None = Depends(require_admin)):
       Operational toggles and response overrides for the Gamal support bot.
     </p>
 
-    <div class="panel">
-      <h3>Documentation index</h3>
-      <p class="dim">
-        Re-pull the docs from source and rebuild the search index on both the
-        <strong>bot</strong> and <strong>api</strong> services. Use this after
-        updating the docs so changes take effect immediately, instead of
-        waiting for the scheduled refresh or a redeploy. Re-indexing takes up
-        to a minute per service; the old index keeps answering until the new
-        one is ready, so there's no downtime.
-      </p>
-      {reindex_table}
-      <form method="POST" action="/admin/reindex" style="margin-top:16px;">
-        <button type="submit" {reindex_btn_attr}>{reindex_btn_label}</button>
-      </form>
-    </div>
+    <div class="grid cols-2">
+      <div class="panel">
+        <h3>Busy mode &nbsp; {busy_status_pill}</h3>
+        <p class="dim">
+          Suppresses the bot's passive proactive offers to the staff roles
+          below — use during busy windows so it doesn't jump in on the team.
+          Staff can still @mention the bot directly.
+        </p>
+        <form method="POST" action="/admin/settings/busy-mode">
+          <label class="inline">
+            <input type="checkbox" name="busy_mode_enabled" value="1" {"checked" if busy_on else ""}>
+            Enable busy mode
+          </label>
+          <label>Staff roles to ignore on the passive path
+            <small class="hint">Comma-separated Discord role names, case-insensitive.</small>
+          </label>
+          <input type="text" name="busy_mode_roles" value="{_esc(busy_roles_value)}"
+                 placeholder="Moderator, Support">
+          <div style="margin-top: 16px;">
+            <button type="submit">Save busy mode</button>
+          </div>
+        </form>
+      </div>
 
-    <div class="panel">
-      <h3>Busy mode &nbsp; {busy_status_pill}</h3>
-      <p class="dim">
-        When busy mode is on, the bot stops sending <strong>passive proactive
-        offers</strong> to members holding the staff roles below. Use it during
-        high-traffic windows so the bot doesn't jump in on your support team's
-        messages while they're helping customers live. Staff can still
-        <strong>@mention</strong> the bot directly — only the uninvited
-        proactive path is suppressed.
-      </p>
-      <form method="POST" action="/admin/settings/busy-mode">
-        <label class="inline">
-          <input type="checkbox" name="busy_mode_enabled" value="1" {"checked" if busy_on else ""}>
-          Enable busy mode
-        </label>
-
-        <label>Staff roles to ignore on the passive path
-          <small class="hint">Comma-separated Discord role names. Case-insensitive. e.g. Moderator, Support, Admin</small>
-        </label>
-        <input type="text" name="busy_mode_roles" value="{_esc(busy_roles_value)}"
-               placeholder="Moderator, Support">
-
-        <div style="margin-top: 16px;">
-          <button type="submit">Save busy mode</button>
-        </div>
-      </form>
+      <div class="panel accent-orange">
+        <h3>Documentation index</h3>
+        <p class="dim">
+          Re-pull the docs and rebuild the search index on the bot and api
+          services. Takes about a minute each; the old index keeps serving
+          until the new one is ready, so there's no downtime.
+        </p>
+        {reindex_table}
+        <form method="POST" action="/admin/reindex" style="margin-top:16px;">
+          <button type="submit" {reindex_btn_attr}>{reindex_btn_label}</button>
+        </form>
+      </div>
     </div>
 
     <h2 style="margin-top:36px;">Doc Overrides</h2>
