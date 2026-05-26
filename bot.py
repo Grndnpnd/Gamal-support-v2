@@ -17,6 +17,7 @@ import aiohttp
 import random
 import re
 import time
+import uuid
 import logging
 from datetime import datetime, timedelta, timezone
 from collections import defaultdict
@@ -192,7 +193,17 @@ def detect_support_intent(message: str) -> tuple[bool, int]:
 class ConversationManager:
     def __init__(self):
         self.conversations: dict = defaultdict(
-            lambda: {"history": [], "last_active": datetime.now(timezone.utc)}
+            lambda: {
+                "history": [],
+                "last_active": datetime.now(timezone.utc),
+                # session_id groups all messages of one back-and-forth for the
+                # admin transcript view. Minted lazily on first access (see
+                # get_session_id) and discarded when the conversation is
+                # cleared or expires — so a user returning after the TTL
+                # starts a fresh session, which is the intended behavior for
+                # non-escalated chats.
+                "session_id": None,
+            }
         )
 
     def _key(self, channel_id: int, user_id: int) -> tuple:
@@ -204,6 +215,22 @@ class ConversationManager:
         self.conversations[key]["last_active"] = datetime.now(timezone.utc)
         if len(self.conversations[key]["history"]) > 20:
             self.conversations[key]["history"] = self.conversations[key]["history"][-20:]
+
+    def get_session_id(self, channel_id: int, user_id: int) -> str:
+        """
+        Return the session id for this conversation, minting one on first
+        call. All messages logged during the same conversation (before its
+        TTL expires or it's cleared) share this id, so the admin panel can
+        reassemble the full transcript.
+
+        Stage 1: this is a plain TTL-scoped id. Stage 2 will re-key escalated
+        conversations to the ticket's Discord thread id instead.
+        """
+        key = self._key(channel_id, user_id)
+        conv = self.conversations[key]
+        if not conv.get("session_id"):
+            conv["session_id"] = f"sess_{uuid.uuid4().hex[:20]}"
+        return conv["session_id"]
 
     def get_history(self, channel_id: int, user_id: int) -> list:
         return self.conversations[self._key(channel_id, user_id)]["history"]
@@ -1202,6 +1229,10 @@ Choose the single best-fit value from this fixed list ONLY:
             question=content,
             topic="override",
             response_source="override",
+            response_text=response,   # the override message, as the user saw it
+            session_id=self.conversations.get_session_id(
+                message.channel.id, message.author.id
+            ),
             resolved_by_bot=not override.get("allow_ticket_offer"),
             doc_gap=False,
             override_id=override["id"],
@@ -1361,6 +1392,10 @@ Choose the single best-fit value from this fixed list ONLY:
             question=content,
             topic=topic,
             response_source=response_source,
+            response_text=response,   # the decorated reply, as the user saw it
+            session_id=self.conversations.get_session_id(
+                message.channel.id, message.author.id
+            ),
             resolved_by_bot=resolved_by_bot,
             doc_gap=doc_gap,
             llm_provider=llm_provider,

@@ -58,10 +58,17 @@ CREATE TABLE IF NOT EXISTS conversations (
 
     -- what happened
     response_source  TEXT,        -- 'docs'|'override'|'fallback'|'escalated'|'unresolved'|'error'
+    response_text    TEXT,                              -- the bot's reply, as the user saw it
     resolved_by_bot  BOOLEAN DEFAULT FALSE,             -- answered, no escalation, no ticket
     doc_gap          BOOLEAN DEFAULT FALSE,             -- answer hit the "can't find it" path
     override_id      TEXT,                              -- set if an override fired
     plain_thread_id  TEXT,                              -- set if a ticket was opened
+
+    -- conversation grouping — all messages in one back-and-forth share a
+    -- session_id, so the admin panel can show a full transcript.
+    --   non-escalated: a TTL-scoped id minted when the conversation starts
+    --   escalated:     re-keyed to the Discord ticket-thread id (stage 2)
+    session_id       TEXT,
 
     -- llm call metadata
     llm_provider     TEXT,                              -- 'bankr' | 'ollama_cloud' | NULL
@@ -72,9 +79,11 @@ CREATE TABLE IF NOT EXISTS conversations (
     error            TEXT                               -- error detail if response_source='error'
 );
 
--- Migration for tables created before the username column existed.
+-- Migrations for tables created before later columns existed.
 -- ADD COLUMN IF NOT EXISTS is idempotent — safe to run on every startup.
-ALTER TABLE conversations ADD COLUMN IF NOT EXISTS username TEXT;
+ALTER TABLE conversations ADD COLUMN IF NOT EXISTS username      TEXT;
+ALTER TABLE conversations ADD COLUMN IF NOT EXISTS response_text TEXT;
+ALTER TABLE conversations ADD COLUMN IF NOT EXISTS session_id    TEXT;
 
 -- Indexes for the dashboard queries. started_at drives every time-window
 -- filter; topic and response_source drive the grouping reports.
@@ -83,6 +92,7 @@ CREATE INDEX IF NOT EXISTS idx_conv_response_source ON conversations (response_s
 CREATE INDEX IF NOT EXISTS idx_conv_topic           ON conversations (topic);
 CREATE INDEX IF NOT EXISTS idx_conv_user            ON conversations (user_id);
 CREATE INDEX IF NOT EXISTS idx_conv_channel         ON conversations (channel_id);
+CREATE INDEX IF NOT EXISTS idx_conv_session         ON conversations (session_id);
 """
 
 
@@ -147,10 +157,12 @@ async def log_conversation(
     question: Optional[str] = None,
     topic: Optional[str] = None,
     response_source: Optional[str] = None,
+    response_text: Optional[str] = None,
     resolved_by_bot: bool = False,
     doc_gap: bool = False,
     override_id: Optional[str] = None,
     plain_thread_id: Optional[str] = None,
+    session_id: Optional[str] = None,
     llm_provider: Optional[str] = None,
     tokens_in: int = 0,
     tokens_out: int = 0,
@@ -174,18 +186,18 @@ async def log_conversation(
                 """
                 INSERT INTO conversations (
                     source, user_id, username, channel_id, question, topic,
-                    response_source, resolved_by_bot, doc_gap, override_id,
-                    plain_thread_id, llm_provider, tokens_in, tokens_out,
-                    latency_ms, error
+                    response_source, response_text, resolved_by_bot, doc_gap,
+                    override_id, plain_thread_id, session_id, llm_provider,
+                    tokens_in, tokens_out, latency_ms, error
                 ) VALUES (
-                    $1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16
+                    $1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18
                 )
                 RETURNING id
                 """,
                 source, user_id, username, channel_id, question, topic,
-                response_source, resolved_by_bot, doc_gap, override_id,
-                plain_thread_id, llm_provider, tokens_in, tokens_out,
-                latency_ms, error,
+                response_source, response_text, resolved_by_bot, doc_gap,
+                override_id, plain_thread_id, session_id, llm_provider,
+                tokens_in, tokens_out, latency_ms, error,
             )
             return row["id"] if row else None
     except Exception as e:
