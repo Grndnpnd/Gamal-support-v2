@@ -38,6 +38,7 @@ import discord
 from aiohttp import web
 from dotenv import load_dotenv
 from redis_map import get_discord_thread_id, is_using_redis
+import db
 
 load_dotenv()
 
@@ -450,6 +451,22 @@ async def handle_plain_webhook(request: web.Request) -> web.Response:
 
     asyncio.ensure_future(send_discord_message(int(discord_thread_id), discord_message))
 
+    # Log the agent reply to the transcript so the admin panel shows the full
+    # ticket conversation. kind marks it transcript-only (the stats dashboard
+    # ignores it); session is the ticket, so it groups with the whole case.
+    # response_text is the agent's actual message; question is left null since
+    # this row is an agent turn, not a user question.
+    asyncio.ensure_future(db.log_conversation(
+        source="plain",
+        kind="ticket_agent_msg",
+        username=agent_name,
+        channel_id=str(discord_thread_id),
+        response_source="ticket_message",
+        response_text=message_text,
+        session_id=f"ticket_{discord_thread_id}",
+        plain_thread_id=thread_id,
+    ))
+
     return web.Response(status=200, text="OK")
 
 
@@ -505,6 +522,12 @@ async def main():
     discord_client = discord.Client(intents=intents)
 
     await discord_client.login(DISCORD_TOKEN)
+
+    # Init the stats DB so agent replies can be logged to the transcript.
+    # No-op if DATABASE_URL is unset — the relay still works, just without
+    # transcript logging of agent replies.
+    await db.init_db()
+
     await start_webhook_server()
 
     log.info("Webhook server running. Press Ctrl+C to stop.")
@@ -515,6 +538,7 @@ async def main():
     except KeyboardInterrupt:
         pass
     finally:
+        await db.close_db()
         await discord_client.close()
 
 

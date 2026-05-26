@@ -70,6 +70,13 @@ CREATE TABLE IF NOT EXISTS conversations (
     --   escalated:     re-keyed to the Discord ticket-thread id (stage 2)
     session_id       TEXT,
 
+    -- row kind — what this row represents. The stats dashboard counts only
+    -- 'bot_response' rows; the transcript view uses all kinds.
+    --   bot_response     a question the bot answered (the original behavior)
+    --   ticket_user_msg  a user message sent inside a ticket thread
+    --   ticket_agent_msg a support-agent reply relayed in from Plain
+    kind             TEXT NOT NULL DEFAULT 'bot_response',
+
     -- llm call metadata
     llm_provider     TEXT,                              -- 'bankr' | 'ollama_cloud' | NULL
     tokens_in        INTEGER DEFAULT 0,
@@ -84,6 +91,7 @@ CREATE TABLE IF NOT EXISTS conversations (
 ALTER TABLE conversations ADD COLUMN IF NOT EXISTS username      TEXT;
 ALTER TABLE conversations ADD COLUMN IF NOT EXISTS response_text TEXT;
 ALTER TABLE conversations ADD COLUMN IF NOT EXISTS session_id    TEXT;
+ALTER TABLE conversations ADD COLUMN IF NOT EXISTS kind          TEXT NOT NULL DEFAULT 'bot_response';
 
 -- Indexes for the dashboard queries. started_at drives every time-window
 -- filter; topic and response_source drive the grouping reports.
@@ -151,6 +159,7 @@ def is_enabled() -> bool:
 async def log_conversation(
     *,
     source: str = "discord",
+    kind: str = "bot_response",
     user_id: Optional[str] = None,
     username: Optional[str] = None,
     channel_id: Optional[str] = None,
@@ -173,9 +182,12 @@ async def log_conversation(
     Insert one conversation row. Returns the new row id, or None if stats
     logging is disabled or the write fails.
 
-    This is called on the bot's hot path (after every answered message), so
-    it must never raise — any failure is logged and swallowed. A stats write
-    failing should never break a user's support interaction.
+    `kind` distinguishes a bot answer ('bot_response', the default and the
+    only kind the stats dashboard counts) from transcript-only message rows
+    ('ticket_user_msg', 'ticket_agent_msg').
+
+    This is called on the bot's hot path, so it must never raise — any
+    failure is logged and swallowed.
     """
     if _pool is None:
         return None
@@ -185,19 +197,19 @@ async def log_conversation(
             row = await conn.fetchrow(
                 """
                 INSERT INTO conversations (
-                    source, user_id, username, channel_id, question, topic,
-                    response_source, response_text, resolved_by_bot, doc_gap,
-                    override_id, plain_thread_id, session_id, llm_provider,
-                    tokens_in, tokens_out, latency_ms, error
+                    source, kind, user_id, username, channel_id, question,
+                    topic, response_source, response_text, resolved_by_bot,
+                    doc_gap, override_id, plain_thread_id, session_id,
+                    llm_provider, tokens_in, tokens_out, latency_ms, error
                 ) VALUES (
-                    $1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18
+                    $1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19
                 )
                 RETURNING id
                 """,
-                source, user_id, username, channel_id, question, topic,
-                response_source, response_text, resolved_by_bot, doc_gap,
-                override_id, plain_thread_id, session_id, llm_provider,
-                tokens_in, tokens_out, latency_ms, error,
+                source, kind, user_id, username, channel_id, question,
+                topic, response_source, response_text, resolved_by_bot,
+                doc_gap, override_id, plain_thread_id, session_id,
+                llm_provider, tokens_in, tokens_out, latency_ms, error,
             )
             return row["id"] if row else None
     except Exception as e:
@@ -273,6 +285,7 @@ async def get_summary(since: datetime, until: datetime) -> dict:
                     COALESCE(sum(tokens_out), 0)                          AS tokens_out
                 FROM conversations
                 WHERE started_at >= $1 AND started_at < $2
+                  AND kind = 'bot_response'
                 """,
                 since, until,
             )
@@ -323,6 +336,7 @@ async def get_timeseries(since: datetime, until: datetime, bucket: str = "day") 
                     COALESCE(sum(tokens_out), 0)                              AS tokens_out
                 FROM conversations
                 WHERE started_at >= $1 AND started_at < $2
+                  AND kind = 'bot_response'
                 GROUP BY bucket
                 ORDER BY bucket
                 """,
@@ -357,6 +371,7 @@ async def get_top_topics(since: datetime, until: datetime, limit: int = 25) -> l
                     count(*) FILTER (WHERE plain_thread_id IS NOT NULL)    AS escalated
                 FROM conversations
                 WHERE started_at >= $1 AND started_at < $2
+                  AND kind = 'bot_response'
                 GROUP BY COALESCE(topic, 'untagged')
                 ORDER BY asked DESC
                 LIMIT $3
@@ -379,12 +394,13 @@ async def get_recent(since: datetime, until: datetime, limit: int = 100) -> list
         async with _pool.acquire() as conn:
             rows = await conn.fetch(
                 """
-                SELECT id, started_at, source, user_id, question, topic,
-                       response_source, resolved_by_bot, doc_gap,
-                       plain_thread_id, llm_provider, tokens_in, tokens_out,
-                       latency_ms, error
+                SELECT id, started_at, kind, source, user_id, username,
+                       question, topic, response_source, resolved_by_bot,
+                       doc_gap, plain_thread_id, session_id, llm_provider,
+                       tokens_in, tokens_out, latency_ms, error
                 FROM conversations
                 WHERE started_at >= $1 AND started_at < $2
+                  AND kind = 'bot_response'
                 ORDER BY started_at DESC
                 LIMIT $3
                 """,
@@ -421,6 +437,7 @@ async def get_top_users(since: datetime, until: datetime, limit: int = 10) -> li
                     count(*) FILTER (WHERE doc_gap)                        AS doc_gaps
                 FROM conversations
                 WHERE started_at >= $1 AND started_at < $2
+                  AND kind = 'bot_response'
                   AND source = 'discord'
                   AND user_id IS NOT NULL
                 GROUP BY user_id, username
@@ -452,6 +469,7 @@ async def get_provider_split(since: datetime, until: datetime) -> list[dict]:
                     count(*)                        AS count
                 FROM conversations
                 WHERE started_at >= $1 AND started_at < $2
+                  AND kind = 'bot_response'
                 GROUP BY llm_provider
                 ORDER BY count DESC
                 """,
@@ -482,6 +500,7 @@ async def get_latency_stats(since: datetime, until: datetime) -> dict:
                     COALESCE(max(latency_ms), 0)                                   AS max_ms
                 FROM conversations
                 WHERE started_at >= $1 AND started_at < $2
+                  AND kind = 'bot_response'
                   AND latency_ms IS NOT NULL
                 """,
                 since, until,
@@ -513,6 +532,7 @@ async def get_busiest_hours(since: datetime, until: datetime) -> list[dict]:
                     count(*)                            AS count
                 FROM conversations
                 WHERE started_at >= $1 AND started_at < $2
+                  AND kind = 'bot_response'
                 GROUP BY hour
                 """,
                 since, until,
@@ -539,6 +559,7 @@ async def get_busiest_channels(since: datetime, until: datetime, limit: int = 8)
                 SELECT channel_id, count(*) AS count
                 FROM conversations
                 WHERE started_at >= $1 AND started_at < $2
+                  AND kind = 'bot_response'
                   AND source = 'discord'
                   AND channel_id IS NOT NULL
                 GROUP BY channel_id
@@ -550,4 +571,62 @@ async def get_busiest_channels(since: datetime, until: datetime, limit: int = 8)
         return [dict(r) for r in rows]
     except Exception as e:
         log.error(f"get_busiest_channels failed: {e}")
+        return []
+
+
+async def rekey_session(old_session_id: str, new_session_id: str) -> int:
+    """
+    Re-point every row of a conversation from one session id to another.
+
+    Used when a conversation escalates into a ticket: the pre-escalation rows
+    were logged under a TTL-scoped 'sess_...' id, but the whole case should
+    read as one transcript keyed to the ticket. This UPDATEs those earlier
+    rows to the ticket session id ('ticket_<discord_thread_id>').
+
+    Returns the number of rows re-keyed. Best-effort — a failure here just
+    means the transcript is split, not that anything breaks.
+    """
+    if _pool is None or not old_session_id or not new_session_id:
+        return 0
+    try:
+        async with _pool.acquire() as conn:
+            result = await conn.execute(
+                "UPDATE conversations SET session_id = $1 WHERE session_id = $2",
+                new_session_id, old_session_id,
+            )
+        moved = int(result.split()[-1]) if result else 0
+        if moved:
+            log.info(f"Re-keyed {moved} row(s) from {old_session_id} to {new_session_id}")
+        return moved
+    except Exception as e:
+        log.error(f"rekey_session failed (swallowed): {e}")
+        return 0
+
+
+async def get_session(session_id: str) -> list[dict]:
+    """
+    Return every row of one conversation session, oldest-first — the full
+    transcript. Includes all kinds (bot answers, ticket user messages, agent
+    replies) so the admin transcript view shows the complete back-and-forth.
+    """
+    if _pool is None or not session_id:
+        return []
+    try:
+        async with _pool.acquire() as conn:
+            rows = await conn.fetch(
+                """
+                SELECT id, started_at, kind, source, user_id, username,
+                       channel_id, question, topic, response_source,
+                       response_text, resolved_by_bot, doc_gap,
+                       plain_thread_id, session_id, llm_provider,
+                       tokens_in, tokens_out, latency_ms, error
+                FROM conversations
+                WHERE session_id = $1
+                ORDER BY started_at ASC, id ASC
+                """,
+                session_id,
+            )
+        return [dict(r) for r in rows]
+    except Exception as e:
+        log.error(f"get_session failed: {e}")
         return []

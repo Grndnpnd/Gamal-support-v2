@@ -223,14 +223,25 @@ class ConversationManager:
         TTL expires or it's cleared) share this id, so the admin panel can
         reassemble the full transcript.
 
-        Stage 1: this is a plain TTL-scoped id. Stage 2 will re-key escalated
-        conversations to the ticket's Discord thread id instead.
+        Non-escalated conversations keep their minted 'sess_...' id. When a
+        conversation escalates, set_session_id swaps it to a ticket-anchored
+        id so the ticket case stays one transcript across TTL gaps.
         """
         key = self._key(channel_id, user_id)
         conv = self.conversations[key]
         if not conv.get("session_id"):
             conv["session_id"] = f"sess_{uuid.uuid4().hex[:20]}"
         return conv["session_id"]
+
+    def set_session_id(self, channel_id: int, user_id: int, session_id: str):
+        """
+        Override a conversation's session id. Used on escalation to re-anchor
+        the session to the ticket ('ticket_<discord_thread_id>'), so messages
+        from here on — and, via db.rekey_session, the earlier ones — all group
+        under the ticket.
+        """
+        key = self._key(channel_id, user_id)
+        self.conversations[key]["session_id"] = session_id
 
     def get_history(self, channel_id: int, user_id: int) -> list:
         return self.conversations[self._key(channel_id, user_id)]["history"]
@@ -762,6 +773,20 @@ Choose the single best-fit value from this fixed list ONLY:
 
         if discord_thread:
             plain_thread_id = self.tickets.get_plain_thread_id(discord_thread.id)
+
+            # Re-key this conversation's session to the ticket. The pre-escalation
+            # messages were logged under a TTL-scoped 'sess_...' id; switch the
+            # live conversation onto a ticket-anchored id and re-point the
+            # already-logged rows to match, so the whole case is one transcript.
+            old_session = self.conversations.get_session_id(
+                message.channel.id, message.author.id
+            )
+            ticket_session = f"ticket_{discord_thread.id}"
+            self.conversations.set_session_id(
+                message.channel.id, message.author.id, ticket_session
+            )
+            asyncio.ensure_future(db.rekey_session(old_session, ticket_session))
+
             return (
                 f"\n\n🎫 I've opened a support ticket for you in {discord_thread.mention}. "
                 f"Our team will respond there. You can also send additional details in that thread.",
@@ -1022,6 +1047,21 @@ Choose the single best-fit value from this fixed list ONLY:
                 "⚠️ Couldn't forward your message to our support team right now. Please try again.",
                 mention_author=False,
             )
+
+        # Log the user's ticket-thread message to the transcript. kind marks it
+        # as a transcript-only row so the stats dashboard ignores it; the
+        # session is the ticket itself, so it groups with the whole case.
+        asyncio.ensure_future(db.log_conversation(
+            source="discord",
+            kind="ticket_user_msg",
+            user_id=str(message.author.id),
+            username=message.author.display_name,
+            channel_id=str(thread_id),
+            question=content,
+            response_source="ticket_message",
+            session_id=f"ticket_{thread_id}",
+            plain_thread_id=self.tickets.get_plain_thread_id(thread_id),
+        ))
 
     # ── Message Routing ────────────────────────────────────────────────────
 
