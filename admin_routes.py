@@ -450,6 +450,15 @@ _BASE_STYLE = """
   .filter-checks .inline { margin: 0; }
   tr.clickable { cursor: pointer; }
   tr.clickable:hover td { background: rgba(128,93,238,0.10); }
+  /* Make the per-cell anchor fill the whole cell so a click anywhere on the
+     row navigates — real <a> links, no JS onclick dependency. */
+  a.rowlink {
+    display: block;
+    color: inherit;
+    text-decoration: none;
+    margin: -10px -8px;
+    padding: 10px 8px;
+  }
   .pager {
     display: flex; justify-content: space-between; align-items: center;
     margin-top: 16px; flex-wrap: wrap; gap: 10px;
@@ -1631,15 +1640,30 @@ async def conversations_list(request: Request, _: None = Depends(require_admin))
             ticket_pill = ' <span class="pill purple">ticket</span>' if r.get("plain_thread_id") else ""
             gap_pill = ' <span class="pill warn">doc gap</span>' if r.get("doc_gap") else ""
             sid = r.get("session_id") or ""
-            link = f"/admin/conversations/{_esc(sid)}" if sid else "#"
+
+            # Each cell's text is wrapped in a real <a> so the row navigates
+            # without relying on JS onclick. Rows with no session_id (logged
+            # before transcript logging existed) aren't linkable — they render
+            # as a plain non-clickable row with a hint.
+            if sid:
+                href = f"/admin/conversations/{_esc(sid)}"
+                def cell(inner, _h=href):
+                    return f'<td><a class="rowlink" href="{_h}">{inner}</a></td>'
+                tr_class = "clickable"
+            else:
+                def cell(inner):
+                    return f"<td>{inner}</td>"
+                tr_class = "noxscript"
+
+            no_transcript = "" if sid else ' <span class="hint">(no transcript)</span>'
             body_rows.append(f"""
-              <tr class="clickable" onclick="location.href='{link}'">
-                <td class="hint">{ts}</td>
-                <td>{_esc(r.get('username') or '—')}</td>
-                <td>{_esc(q)}</td>
-                <td>{_esc(r.get('topic') or '—')}</td>
-                <td><span class="pill {rs_class}">{_esc(rs)}</span>{ticket_pill}{gap_pill}</td>
-                <td class="hint">{_esc(r.get('llm_provider') or '—')}</td>
+              <tr class="{tr_class}">
+                {cell(f'<span class="hint">{ts}</span>')}
+                {cell(_esc(r.get('username') or '—'))}
+                {cell(_esc(q) + no_transcript)}
+                {cell(_esc(r.get('topic') or '—'))}
+                {cell(f'<span class="pill {rs_class}">{_esc(rs)}</span>{ticket_pill}{gap_pill}')}
+                {cell(f'<span class="hint">{_esc(r.get("llm_provider") or "—")}</span>')}
               </tr>
             """)
         results_table = f"""
