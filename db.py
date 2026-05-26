@@ -630,3 +630,90 @@ async def get_session(session_id: str) -> list[dict]:
     except Exception as e:
         log.error(f"get_session failed: {e}")
         return []
+
+
+async def search_conversations(
+    *,
+    since: datetime,
+    until: datetime,
+    topic: Optional[str] = None,
+    response_source: Optional[str] = None,
+    llm_provider: Optional[str] = None,
+    doc_gap_only: bool = False,
+    errors_only: bool = False,
+    tickets_only: bool = False,
+    text_query: Optional[str] = None,
+    username_query: Optional[str] = None,
+    limit: int = 50,
+    offset: int = 0,
+) -> dict:
+    """
+    Filtered, paginated search over conversations for the admin panel's
+    Conversations tab.
+
+    Searches only kind='bot_response' rows — those are the "a user asked
+    something" entries. Ticket user/agent messages are transcript detail,
+    surfaced via get_session when a row is opened, not as standalone search
+    hits.
+
+    All filters are optional and AND-combined. Returns:
+      { "rows": [...], "total": <int matching the filters> }
+    so the UI can show "showing 1-50 of 312" and paginate.
+    """
+    if _pool is None:
+        return {"rows": [], "total": 0}
+
+    # Build the WHERE clause dynamically. $1/$2 are always the time window;
+    # further params are appended as filters are added.
+    conditions = ["started_at >= $1", "started_at < $2", "kind = 'bot_response'"]
+    params: list = [since, until]
+
+    def _add(cond_tmpl: str, value):
+        params.append(value)
+        conditions.append(cond_tmpl.format(n=len(params)))
+
+    if topic:
+        _add("topic = ${n}", topic)
+    if response_source:
+        _add("response_source = ${n}", response_source)
+    if llm_provider:
+        _add("llm_provider = ${n}", llm_provider)
+    if doc_gap_only:
+        conditions.append("doc_gap = TRUE")
+    if errors_only:
+        conditions.append("response_source = 'error'")
+    if tickets_only:
+        conditions.append("plain_thread_id IS NOT NULL")
+    if text_query:
+        # case-insensitive substring match on the question text
+        _add("question ILIKE '%' || ${n} || '%'", text_query)
+    if username_query:
+        _add("username ILIKE '%' || ${n} || '%'", username_query)
+
+    where = " AND ".join(conditions)
+
+    try:
+        async with _pool.acquire() as conn:
+            total = await conn.fetchval(
+                f"SELECT count(*) FROM conversations WHERE {where}", *params
+            )
+            # limit/offset are the last two params
+            params_paged = params + [limit, offset]
+            rows = await conn.fetch(
+                f"""
+                SELECT id, started_at, kind, source, user_id, username,
+                       channel_id, question, topic, response_source,
+                       response_text, resolved_by_bot, doc_gap,
+                       plain_thread_id, session_id, llm_provider,
+                       tokens_in, tokens_out, latency_ms, error
+                FROM conversations
+                WHERE {where}
+                ORDER BY started_at DESC
+                LIMIT ${len(params) + 1} OFFSET ${len(params) + 2}
+                """,
+                *params_paged,
+            )
+        return {"rows": [dict(r) for r in rows], "total": total or 0}
+    except Exception as e:
+        log.error(f"search_conversations failed: {e}")
+        return {"rows": [], "total": 0}

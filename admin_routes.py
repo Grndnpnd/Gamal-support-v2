@@ -436,6 +436,57 @@ _BASE_STYLE = """
     flex: 0 0 auto; font-variant-numeric: tabular-nums;
     color: var(--text-dim); font-size: 12px; min-width: 32px; text-align: right;
   }
+
+  /* ── Conversations browser ── */
+  .filter-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(160px, 1fr));
+    gap: 12px;
+  }
+  .filter-checks {
+    display: flex; flex-wrap: wrap; gap: 16px;
+    align-items: center; margin-top: 14px;
+  }
+  .filter-checks .inline { margin: 0; }
+  tr.clickable { cursor: pointer; }
+  tr.clickable:hover td { background: rgba(128,93,238,0.10); }
+  .pager {
+    display: flex; justify-content: space-between; align-items: center;
+    margin-top: 16px; flex-wrap: wrap; gap: 10px;
+  }
+  .rangebtn.disabled {
+    opacity: 0.5; pointer-events: none;
+  }
+
+  /* ── Transcript view ── */
+  .transcript { display: flex; flex-direction: column; gap: 14px; }
+  .msg { max-width: 82%; }
+  .msg-who {
+    font-size: 11px; color: var(--text-faint); margin-bottom: 3px;
+    font-weight: 600;
+  }
+  .msg-ts { color: var(--text-faint); font-weight: 400; margin-left: 4px; }
+  .msg-body {
+    padding: 10px 14px; border-radius: 12px; font-size: 13px;
+    white-space: pre-wrap; word-break: break-word;
+  }
+  .msg-user { align-self: flex-start; }
+  .msg-user .msg-body {
+    background: var(--panel-2); border: 1px solid var(--border);
+    border-bottom-left-radius: 4px;
+  }
+  .msg-bot { align-self: flex-end; }
+  .msg-bot .msg-who { text-align: right; }
+  .msg-bot .msg-body {
+    background: rgba(128,93,238,0.16); border: 1px solid rgba(128,93,238,0.35);
+    border-bottom-right-radius: 4px;
+  }
+  .msg-agent { align-self: flex-end; }
+  .msg-agent .msg-who { text-align: right; }
+  .msg-agent .msg-body {
+    background: rgba(255,103,60,0.14); border: 1px solid rgba(255,103,60,0.35);
+    border-bottom-right-radius: 4px;
+  }
 </style>
 """
 
@@ -446,6 +497,7 @@ def _page(title: str, body: str, show_nav: bool = True, head_extra: str = "") ->
         nav = """
         <nav>
           <a href="/admin">Controls</a>
+          <a href="/admin/conversations">Conversations</a>
           <a href="/admin/stats">Stats</a>
           <a href="/admin/logout">Sign out</a>
         </nav>
@@ -1438,3 +1490,334 @@ async def stats_dashboard(request: Request, _: None = Depends(require_admin)):
     {chart_script}
     """
     return HTMLResponse(_page("Stats", body, head_extra=head_extra))
+
+
+# ─── Conversations / Transcript browser ───────────────────────────────────────
+#
+# Two routes:
+#   /admin/conversations              filtered, paginated search over bot_response rows
+#   /admin/conversations/{session_id} full transcript of one conversation, + download
+
+# Topic vocabulary for the filter dropdown — mirrors the fixed list the bot
+# uses when tagging. Kept here so the dropdown doesn't need to import bot.py.
+_TOPIC_OPTIONS = [
+    "dca", "swaps", "wallet", "fees", "token-launch", "staking",
+    "leaderboard", "bankr-club", "api", "openclaw", "bridging",
+    "airdrop", "nft", "portfolio", "account-access", "partnership",
+    "greeting", "other", "override",
+]
+_OUTCOME_OPTIONS = ["docs", "override", "escalated", "fallback", "unresolved", "error"]
+_PROVIDER_OPTIONS = ["bankr", "ollama_cloud"]
+_PAGE_SIZE = 50
+
+
+def _kind_label(kind: str) -> str:
+    return {
+        "bot_response": "Bot reply",
+        "ticket_user_msg": "User (ticket)",
+        "ticket_agent_msg": "Agent (ticket)",
+    }.get(kind, kind)
+
+
+@router.get("/conversations", response_class=HTMLResponse)
+async def conversations_list(request: Request, _: None = Depends(require_admin)):
+    """Filtered, paginated browser over logged conversations."""
+    qp = request.query_params
+
+    if not db.is_enabled():
+        body = """
+        <h2>Conversations</h2>
+        <div class="panel"><div class="empty">
+          Stats database not connected. Set <code>DATABASE_URL</code> and redeploy.
+        </div></div>
+        """
+        return HTMLResponse(_page("Conversations", body))
+
+    since, until, _bucket, label = _resolve_window(
+        qp.get("range"), qp.get("from"), qp.get("to")
+    )
+
+    # Filters
+    f_topic    = qp.get("topic") or ""
+    f_outcome  = qp.get("outcome") or ""
+    f_provider = qp.get("provider") or ""
+    f_text     = qp.get("q") or ""
+    f_user     = qp.get("user") or ""
+    f_docgap   = qp.get("docgap") == "1"
+    f_errors   = qp.get("errors") == "1"
+    f_tickets  = qp.get("tickets") == "1"
+
+    try:
+        page = max(1, int(qp.get("page", "1")))
+    except ValueError:
+        page = 1
+    offset = (page - 1) * _PAGE_SIZE
+
+    result = await db.search_conversations(
+        since=since, until=until,
+        topic=f_topic or None,
+        response_source=f_outcome or None,
+        llm_provider=f_provider or None,
+        doc_gap_only=f_docgap,
+        errors_only=f_errors,
+        tickets_only=f_tickets,
+        text_query=f_text or None,
+        username_query=f_user or None,
+        limit=_PAGE_SIZE, offset=offset,
+    )
+    rows = result["rows"]
+    total = result["total"]
+    total_pages = max(1, (total + _PAGE_SIZE - 1) // _PAGE_SIZE)
+
+    # ── Build filter form ────────────────────────────────────────────────────
+    def _opts(options: list, selected: str) -> str:
+        out = ['<option value="">any</option>']
+        for o in options:
+            sel = " selected" if o == selected else ""
+            out.append(f'<option value="{_esc(o)}"{sel}>{_esc(o)}</option>')
+        return "".join(out)
+
+    # carry the active time range into the form so filtering keeps the window
+    range_hidden = ""
+    if qp.get("from") and qp.get("to"):
+        range_hidden = (
+            f'<input type="hidden" name="from" value="{_esc(qp.get("from"))}">'
+            f'<input type="hidden" name="to" value="{_esc(qp.get("to"))}">'
+        )
+    elif qp.get("range"):
+        range_hidden = f'<input type="hidden" name="range" value="{_esc(qp.get("range"))}">'
+
+    filter_form = f"""
+      <form method="GET" action="/admin/conversations" class="filter-form">
+        {range_hidden}
+        <div class="filter-grid">
+          <label>Topic
+            <select name="topic">{_opts(_TOPIC_OPTIONS, f_topic)}</select>
+          </label>
+          <label>Outcome
+            <select name="outcome">{_opts(_OUTCOME_OPTIONS, f_outcome)}</select>
+          </label>
+          <label>Provider
+            <select name="provider">{_opts(_PROVIDER_OPTIONS, f_provider)}</select>
+          </label>
+          <label>Question contains
+            <input type="text" name="q" value="{_esc(f_text)}" placeholder="search text">
+          </label>
+          <label>User
+            <input type="text" name="user" value="{_esc(f_user)}" placeholder="username">
+          </label>
+        </div>
+        <div class="filter-checks">
+          <label class="inline"><input type="checkbox" name="docgap" value="1" {"checked" if f_docgap else ""}> Doc gaps only</label>
+          <label class="inline"><input type="checkbox" name="errors" value="1" {"checked" if f_errors else ""}> Errors only</label>
+          <label class="inline"><input type="checkbox" name="tickets" value="1" {"checked" if f_tickets else ""}> Became a ticket</label>
+          <button type="submit">Apply filters</button>
+          <a class="btn secondary" href="/admin/conversations">Clear</a>
+        </div>
+      </form>
+    """
+
+    # ── Results table ────────────────────────────────────────────────────────
+    if rows:
+        body_rows = []
+        for r in rows:
+            ts = r["started_at"].strftime("%Y-%m-%d %H:%M")
+            q = (r["question"] or "")[:90]
+            rs = r["response_source"] or ""
+            rs_class = {
+                "docs": "on", "override": "purple", "escalated": "warn",
+                "error": "danger-pill", "unresolved": "off", "fallback": "warn",
+            }.get(rs, "off")
+            ticket_pill = ' <span class="pill purple">ticket</span>' if r.get("plain_thread_id") else ""
+            gap_pill = ' <span class="pill warn">doc gap</span>' if r.get("doc_gap") else ""
+            sid = r.get("session_id") or ""
+            link = f"/admin/conversations/{_esc(sid)}" if sid else "#"
+            body_rows.append(f"""
+              <tr class="clickable" onclick="location.href='{link}'">
+                <td class="hint">{ts}</td>
+                <td>{_esc(r.get('username') or '—')}</td>
+                <td>{_esc(q)}</td>
+                <td>{_esc(r.get('topic') or '—')}</td>
+                <td><span class="pill {rs_class}">{_esc(rs)}</span>{ticket_pill}{gap_pill}</td>
+                <td class="hint">{_esc(r.get('llm_provider') or '—')}</td>
+              </tr>
+            """)
+        results_table = f"""
+          <table>
+            <thead><tr>
+              <th>Time</th><th>User</th><th>Question</th>
+              <th>Topic</th><th>Outcome</th><th>Provider</th>
+            </tr></thead>
+            <tbody>{''.join(body_rows)}</tbody>
+          </table>
+        """
+    else:
+        results_table = '<div class="empty">No conversations match these filters.</div>'
+
+    # ── Pagination ───────────────────────────────────────────────────────────
+    # preserve all current query params except page
+    def _page_url(p: int) -> str:
+        parts = []
+        for k, v in qp.items():
+            if k == "page":
+                continue
+            parts.append(f"{k}={v}")
+        parts.append(f"page={p}")
+        return "/admin/conversations?" + "&".join(parts)
+
+    pager = ""
+    if total > 0:
+        first = offset + 1
+        last = min(offset + _PAGE_SIZE, total)
+        prev_btn = (
+            f'<a class="rangebtn" href="{_page_url(page-1)}">‹ Prev</a>'
+            if page > 1 else '<span class="rangebtn disabled">‹ Prev</span>'
+        )
+        next_btn = (
+            f'<a class="rangebtn" href="{_page_url(page+1)}">Next ›</a>'
+            if page < total_pages else '<span class="rangebtn disabled">Next ›</span>'
+        )
+        pager = f"""
+          <div class="pager">
+            <span class="hint">Showing {first}–{last} of {total:,}</span>
+            <div class="preset-row">
+              {prev_btn}
+              <span class="rangebtn disabled">Page {page} / {total_pages}</span>
+              {next_btn}
+            </div>
+          </div>
+        """
+
+    body = f"""
+    <h2>Conversations</h2>
+    <p class="dim">
+      Searchable log of every interaction — {_esc(label)}. Click a row to open
+      the full transcript.
+    </p>
+    <div class="panel">{filter_form}</div>
+    <div class="panel">
+      {results_table}
+      {pager}
+    </div>
+    """
+    return HTMLResponse(_page("Conversations", body))
+
+
+def _render_transcript_text(rows: list) -> str:
+    """Plain-text transcript, used for the download."""
+    lines = []
+    for r in rows:
+        ts = r["started_at"].strftime("%Y-%m-%d %H:%M:%S UTC")
+        kind = r["kind"]
+        if kind == "bot_response":
+            who_q = r.get("username") or "User"
+            lines.append(f"[{ts}] {who_q}:")
+            lines.append(f"  {r.get('question') or ''}")
+            lines.append(f"[{ts}] Gamal (bot):")
+            lines.append(f"  {r.get('response_text') or ''}")
+        elif kind == "ticket_user_msg":
+            lines.append(f"[{ts}] {r.get('username') or 'User'} (ticket):")
+            lines.append(f"  {r.get('question') or ''}")
+        elif kind == "ticket_agent_msg":
+            lines.append(f"[{ts}] {r.get('username') or 'Agent'} (support agent):")
+            lines.append(f"  {r.get('response_text') or ''}")
+        lines.append("")
+    return "\n".join(lines)
+
+
+@router.get("/conversations/{session_id}", response_class=HTMLResponse)
+async def conversation_transcript(
+    session_id: str, request: Request, _: None = Depends(require_admin)
+):
+    """Full transcript of one conversation session."""
+    if not db.is_enabled():
+        return HTMLResponse(_page("Transcript", '<div class="empty">Database not connected.</div>'))
+
+    rows = await db.get_session(session_id)
+    if not rows:
+        body = """
+        <h2>Transcript</h2>
+        <div class="panel"><div class="empty">
+          No messages found for this session. It may pre-date transcript
+          logging, or the id is invalid.
+        </div></div>
+        <a class="btn secondary" href="/admin/conversations">← Back to conversations</a>
+        """
+        return HTMLResponse(_page("Transcript", body))
+
+    # Download mode — ?download=1 returns the transcript as a text file
+    if request.query_params.get("download") == "1":
+        text = _render_transcript_text(rows)
+        return Response(
+            content=text,
+            media_type="text/plain",
+            headers={
+                "Content-Disposition": f'attachment; filename="transcript_{session_id}.txt"'
+            },
+        )
+
+    # ── Header / summary ─────────────────────────────────────────────────────
+    first = rows[0]
+    last = rows[-1]
+    started = first["started_at"].strftime("%Y-%m-%d %H:%M UTC")
+    ended = last["started_at"].strftime("%Y-%m-%d %H:%M UTC")
+    is_ticket = session_id.startswith("ticket_")
+    msg_count = len(rows)
+    primary_user = next(
+        (r.get("username") for r in rows if r.get("kind") != "ticket_agent_msg" and r.get("username")),
+        "Unknown",
+    )
+    kind_pill = (
+        '<span class="pill purple">ticket</span>' if is_ticket
+        else '<span class="pill off">chat</span>'
+    )
+
+    # ── Message bubbles ──────────────────────────────────────────────────────
+    bubbles = []
+    for r in rows:
+        ts = r["started_at"].strftime("%m-%d %H:%M")
+        kind = r["kind"]
+        if kind == "bot_response":
+            user = _esc(r.get("username") or "User")
+            bubbles.append(f"""
+              <div class="msg msg-user">
+                <div class="msg-who">{user} <span class="msg-ts">{ts}</span></div>
+                <div class="msg-body">{_esc(r.get('question') or '')}</div>
+              </div>
+              <div class="msg msg-bot">
+                <div class="msg-who">Gamal <span class="msg-ts">{ts}</span></div>
+                <div class="msg-body">{_esc(r.get('response_text') or '')}</div>
+              </div>
+            """)
+        elif kind == "ticket_user_msg":
+            user = _esc(r.get("username") or "User")
+            bubbles.append(f"""
+              <div class="msg msg-user">
+                <div class="msg-who">{user} <span class="pill off">ticket</span> <span class="msg-ts">{ts}</span></div>
+                <div class="msg-body">{_esc(r.get('question') or '')}</div>
+              </div>
+            """)
+        elif kind == "ticket_agent_msg":
+            agent = _esc(r.get("username") or "Support Agent")
+            bubbles.append(f"""
+              <div class="msg msg-agent">
+                <div class="msg-who">{agent} <span class="pill warn">agent</span> <span class="msg-ts">{ts}</span></div>
+                <div class="msg-body">{_esc(r.get('response_text') or '')}</div>
+              </div>
+            """)
+
+    body = f"""
+    <a class="btn secondary" href="/admin/conversations">← Back to conversations</a>
+    <h2 style="margin-top:16px;">Transcript &nbsp; {kind_pill}</h2>
+    <p class="dim">
+      {_esc(primary_user)} · {msg_count} message{'s' if msg_count != 1 else ''} ·
+      {started} → {ended}
+    </p>
+    <div style="margin-bottom:16px;">
+      <a class="btn" href="/admin/conversations/{_esc(session_id)}?download=1">Download .txt</a>
+    </div>
+    <div class="panel">
+      <div class="transcript">{''.join(bubbles)}</div>
+    </div>
+    """
+    return HTMLResponse(_page("Transcript", body))
