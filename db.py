@@ -235,6 +235,48 @@ async def update_conversation_ticket(row_id: int, plain_thread_id: str) -> None:
         log.error(f"update_conversation_ticket failed (swallowed): {e}")
 
 
+async def mark_ticket_for_session(session_id: str, plain_thread_id: str) -> int:
+    """
+    Backfill plain_thread_id onto the escalation row(s) of a conversation,
+    located by session_id rather than by a row id held in memory.
+
+    This is the redeploy-safe way to record "this escalation became a ticket".
+    The bot's escalation flow spans two messages (offer, then the user's
+    "yes"); a row id captured at offer-time lives only in memory and is lost
+    if the bot redeploys in between. session_id is stable conversation state,
+    so locating the row by it survives a restart.
+
+    Updates bot_response rows in the session whose response_source is
+    'escalated' and that don't already have a plain_thread_id. Returns the
+    number of rows updated. Best-effort — never raises.
+    """
+    if _pool is None or not session_id or not plain_thread_id:
+        return 0
+    try:
+        async with _pool.acquire() as conn:
+            result = await conn.execute(
+                """
+                UPDATE conversations
+                SET plain_thread_id = $1
+                WHERE session_id = $2
+                  AND kind = 'bot_response'
+                  AND response_source = 'escalated'
+                  AND plain_thread_id IS NULL
+                """,
+                plain_thread_id, session_id,
+            )
+        updated = int(result.split()[-1]) if result else 0
+        if updated:
+            log.info(
+                f"Marked {updated} escalation row(s) of session {session_id} "
+                f"as ticket {plain_thread_id}"
+            )
+        return updated
+    except Exception as e:
+        log.error(f"mark_ticket_for_session failed (swallowed): {e}")
+        return 0
+
+
 async def prune_old_rows() -> int:
     """
     Delete rows older than STATS_RETENTION_DAYS. Called periodically from the

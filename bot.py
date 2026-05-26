@@ -887,8 +887,8 @@ Choose the single best-fit value from this fixed list ONLY:
 
         if is_yes:
             del self._pending_escalations[key]
-            # Pull (and clear) the row id of the message that triggered this
-            # escalation offer, so we can backfill the ticket onto it.
+            # Row id captured at offer-time — may be None if the bot redeployed
+            # between the offer and this "yes" (it lives only in memory).
             row_id = self._pending_row_ids.pop(key, None)
 
             suffix, plain_thread_id = await self._open_ticket_for_user(
@@ -899,11 +899,19 @@ Choose the single best-fit value from this fixed list ONLY:
                 mention_author=False,
             )
 
-            # Backfill the stats row: mark that this escalation became a real
-            # ticket. Without this, the row stays response_source='escalated'
-            # with no plain_thread_id and "tickets created" undercounts.
-            if row_id and plain_thread_id:
-                await db.update_conversation_ticket(row_id, plain_thread_id)
+            # Backfill the stats row so "tickets created" counts this.
+            # Capture session_id AFTER _open_ticket_for_user: that call
+            # re-keys the conversation (and its rows) to the ticket session,
+            # so the post-call session id is the one the escalation rows now
+            # carry. Primary path is by session_id (survives a redeploy
+            # mid-escalation); the row_id path is a fallback.
+            if plain_thread_id:
+                session_id = self.conversations.get_session_id(
+                    message.channel.id, message.author.id
+                )
+                marked = await db.mark_ticket_for_session(session_id, plain_thread_id)
+                if marked == 0 and row_id:
+                    await db.update_conversation_ticket(row_id, plain_thread_id)
 
             log.info(f"User confirmed ticket for pending escalation: {message.author}")
             return True
