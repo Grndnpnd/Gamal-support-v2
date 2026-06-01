@@ -724,11 +724,23 @@ async def propose(
     total_out += p2_out
 
     for sug in suggestions:
+        suggested_category = str(sug.get("suggested_category") or "")
+        # The LLM is constrained by prompt to return one of our 9 known
+        # category names. Resolve it to the actual Plain group ID so the
+        # publish step lands new articles in the right category — without
+        # this they'd publish uncategorized at the help-center root.
+        resolved_group_id = plain_articles.group_id_by_name(suggested_category) or ""
+        if suggested_category and not resolved_group_id:
+            log.warning(
+                f"Pass 2 returned unknown category {suggested_category!r} for "
+                f"slug {sug.get('suggested_slug')!r} — article would publish uncategorized"
+            )
         items.append(ProposalItem(
             kind="new_topic",
             slug=str(sug.get("suggested_slug") or ""),
             title=str(sug.get("suggested_title") or ""),
-            group_name=str(sug.get("suggested_category") or ""),
+            group_id=resolved_group_id,
+            group_name=suggested_category,
             reason=str(sug.get("reason") or ""),
             docs_excerpt=(
                 "Docs sections: " + ", ".join(sug.get("docs_sections") or [])
@@ -921,7 +933,7 @@ async def publish_items(
             continue
 
         try:
-            result = await plain_client.upsert_help_center_article(
+            article = await plain_client.upsert_help_center_article(
                 help_center_id   = plain_articles.HELP_CENTER_ID,
                 title            = it.title,
                 content_html     = it.content_html,
@@ -934,15 +946,18 @@ async def publish_items(
                 # keep their existing status.
                 status           = "DRAFT" if it.is_new else None,
             )
-            if result and result.get("article"):
+            # PlainClient.upsert_help_center_article returns the article dict
+            # directly ({id, slug, title, status}) on success, None on any
+            # error (the client logs GraphQL errors verbatim before returning).
+            if article and article.get("id"):
                 out.append({
                     "slug": it.slug, "ok": True, "is_new": it.is_new,
-                    "plain_id_after": result["article"].get("id") or it.plain_id,
+                    "plain_id_after": article["id"],
                     "error": None,
                 })
             else:
-                # PlainClient returns None on error and logs the GraphQL
-                # response. Pass that signal up.
+                # plain_client returned None → it already logged the cause.
+                # The api logs are the source of truth here.
                 out.append({
                     "slug": it.slug, "ok": False, "is_new": it.is_new,
                     "plain_id_after": it.plain_id,

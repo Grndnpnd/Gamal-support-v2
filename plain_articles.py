@@ -43,6 +43,8 @@ WRITING GUIDELINES (used by the propose LLM prompt — single source of truth):
 
 # Help center the articles live in (the public Bankr help center).
 # Hard-coded here so callers don't need to pass it through.
+from typing import Optional
+
 HELP_CENTER_ID = "hc_01KNJE5VXXTKN1A96NE0KFRNRK"
 
 # Article-group IDs (Plain's "categories"). Confirmed live via Plain GraphQL.
@@ -250,6 +252,29 @@ def get_by_plain_id(plain_id: str) -> dict | None:
 def iter_articles():
     """Iterate the article entries in declaration order."""
     return iter(ARTICLES)
+
+
+def group_id_by_name(category_name: str) -> Optional[str]:
+    """
+    Map a human-readable category name (e.g. 'Apps & Extensions') back to
+    its Plain article-group ID (hcag_...).
+
+    Used when the propose pipeline's Pass 2 suggests new articles — the
+    LLM returns a category name string, and we need the ID to send to
+    Plain's upsert mutation. Returns None if the name doesn't match any
+    known group, which lets the caller fall back to "uncategorized"
+    (drafted at the root of the help center) rather than crashing.
+
+    Match is case-sensitive against _GROUP_NAMES values. The Pass 2 prompt
+    constrains the LLM to those exact strings, so a miss here usually
+    indicates the LLM ignored the schema — log it.
+    """
+    if not category_name:
+        return None
+    for key, name in _GROUP_NAMES.items():
+        if name == category_name:
+            return GROUPS[key]
+    return None
 
 
 def slug_to_plain_id_map() -> dict[str, str]:
