@@ -41,7 +41,14 @@ from redis_overrides import (
     update_override,
 )
 from redis_settings import get_settings, update_settings
-from redis_pubsub import request_reindex, get_reindex_statuses, KNOWN_SERVICES
+from redis_pubsub import (
+    request_reindex, get_reindex_statuses, KNOWN_SERVICES,
+    request_article_sync, get_article_sync_status,
+    get_article_sync_proposal,
+    set_pin, unset_pin, get_pins,
+    save_item_edit, get_item_edits,
+    save_publish_result, get_publish_result,
+)
 import db
 
 log = logging.getLogger(__name__)
@@ -748,6 +755,57 @@ async def dashboard(_: None = Depends(require_admin)):
     reindex_btn_label = "Re-indexing…" if any_running else "Re-pull &amp; re-index docs"
     reindex_btn_attr = "disabled" if any_running else ""
 
+    # ── Article-sync panel state ─────────────────────────────────────────────
+    # Three states render the panel differently:
+    #   running  → show "in flight" pill + the trigger button shows "Already
+    #              running — click to cancel and start a new run" (JS confirm)
+    #   ready    → show "proposal ready" pill + a "Review proposal" link plus
+    #              a "Generate new proposal" button (which replaces the
+    #              pending one, with confirm)
+    #   failed   → show "failed" pill + the error detail
+    #   idle/None → show "no proposal yet" + a normal trigger button
+    sync_status = await get_article_sync_status()
+    sync_state = (sync_status or {}).get("state", "idle")
+    sync_when = _relative_time((sync_status or {}).get("at"))
+    sync_detail = (sync_status or {}).get("detail", "")
+    sync_proposal_id = (sync_status or {}).get("proposal_id", "")
+
+    if sync_state == "running":
+        sync_pill = '<span class="pill warn">in progress…</span>'
+        sync_line = f"Started {sync_when}" + (f" — {_esc(sync_detail)}" if sync_detail else "")
+        sync_btn_label = "Cancel current run &amp; start a new one"
+        # JS confirm — same shape as overrides' delete button. If the admin
+        # clicks Cancel they stay on the page.
+        sync_btn_confirm = (
+            "onsubmit=\"return confirm('A help-center sync is already running. "
+            "Cancel it and start a new run?');\""
+        )
+    elif sync_state == "ready":
+        sync_pill = '<span class="pill on">proposal ready for review</span>'
+        sync_line = f"Generated {sync_when}" + (f" — {_esc(sync_detail)}" if sync_detail else "")
+        sync_btn_label = "Generate a new proposal (replaces the pending one)"
+        sync_btn_confirm = (
+            "onsubmit=\"return confirm('A proposal is already waiting for review. "
+            "Replace it with a new run?');\""
+        )
+    elif sync_state == "failed":
+        sync_pill = '<span class="pill danger-pill">failed</span>'
+        sync_line = f"Failed {sync_when}" + (f" — {_esc(sync_detail)}" if sync_detail else "")
+        sync_btn_label = "Try again"
+        sync_btn_confirm = ""
+    else:
+        sync_pill = '<span class="pill off">idle</span>'
+        sync_line = "No proposal yet — click to generate one."
+        sync_btn_label = "Generate help-center proposal"
+        sync_btn_confirm = ""
+
+    review_link_html = ""
+    if sync_state == "ready" and sync_proposal_id:
+        review_link_html = (
+            '<a class="btn" style="margin-right:8px;" '
+            f'href="/admin/article-sync/review">Review proposal</a>'
+        )
+
     body = f"""
     <h2>Bot Controls</h2>
     <p class="dim">
@@ -788,6 +846,23 @@ async def dashboard(_: None = Depends(require_admin)):
         {reindex_table}
         <form method="POST" action="/admin/reindex" style="margin-top:16px;">
           <button type="submit" {reindex_btn_attr}>{reindex_btn_label}</button>
+        </form>
+      </div>
+    </div>
+
+    <div class="panel accent-yellow">
+      <h3>Help center sync &nbsp; {sync_pill}</h3>
+      <p class="dim">
+        Generate a proposal of what should change in the customer-facing
+        help center at help.bankr.bot — based on the latest documentation.
+        The proposal is reviewed and edited before anything is published;
+        nothing goes live until you click Publish on the review page.
+      </p>
+      <p class="hint" style="margin: 0 0 14px;">{sync_line}</p>
+      <div style="display:flex; flex-wrap:wrap; gap:8px; align-items:center;">
+        {review_link_html}
+        <form method="POST" action="/admin/article-sync" style="display:inline;" {sync_btn_confirm}>
+          <button class="secondary" type="submit">{sync_btn_label}</button>
         </form>
       </div>
     </div>
@@ -874,6 +949,29 @@ async def trigger_reindex(request: Request, _: None = Depends(require_admin)):
     """
     _check_csrf(request)
     await request_reindex(triggered_by="admin panel")
+    return RedirectResponse("/admin", status_code=303)
+
+
+@router.post("/article-sync")
+async def trigger_article_sync(request: Request, _: None = Depends(require_admin)):
+    """
+    Trigger a help-center article-sync propose run.
+
+    Publishes a signal via Redis pub/sub. The api service's subscriber
+    catches it, runs the propose pipeline (two LLM passes, no Plain writes),
+    and stashes the resulting proposal in Redis for the review page.
+
+    This route returns immediately. If a run is already in progress or a
+    pending proposal exists, the admin already confirmed they want to
+    replace it via the Controls page's JS confirm() before submitting —
+    we don't re-check here. The pub/sub plumbing happily accepts a new
+    request that supersedes the previous status.
+
+    The actual Plain article upserts happen later, only when the admin
+    clicks Publish on the review page (stage 3) — never from this route.
+    """
+    _check_csrf(request)
+    await request_article_sync(triggered_by="admin panel")
     return RedirectResponse("/admin", status_code=303)
 
 
@@ -1845,3 +1943,773 @@ async def conversation_transcript(
     </div>
     """
     return HTMLResponse(_page("Transcript", body))
+
+
+# ╔════════════════════════════════════════════════════════════════════════════╗
+# ║  Article Sync — review / publish UI                                        ║
+# ║                                                                            ║
+# ║  Companion to the /admin/article-sync POST handler above. That handler     ║
+# ║  fires the propose pipeline. The routes below let an admin:                ║
+# ║    - Review the resulting proposal                                         ║
+# ║    - Edit proposed bodies / descriptions                                   ║
+# ║    - Pin/unpin slugs (deliberate "leave this alone" markers)               ║
+# ║    - Generate bodies for new-topic suggestions on demand                   ║
+# ║    - Bulk-publish selected items to Plain                                  ║
+# ║    - View per-article publish results                                      ║
+# ║                                                                            ║
+# ║  All state lives in Redis: proposal blob, per-item edits, pins, results.   ║
+# ║  Nothing on the page is autosaved — every change is an explicit POST.     ║
+# ╚════════════════════════════════════════════════════════════════════════════╝
+
+# Cap on bulk publish before a JS confirm prompt fires. Tunable.
+_BULK_PUBLISH_CONFIRM_THRESHOLD = 5
+
+
+def _compose_item(item_dict: dict, edits_for_slug: Optional[dict]) -> dict:
+    """
+    Layer per-item edits onto a proposal item to get the *effective* view.
+
+    Why this exists: the propose pipeline writes a Proposal blob to Redis.
+    When an admin edits a proposed body and saves it, we DON'T mutate that
+    blob — we record the edit in a separate Redis key. The review page
+    reads both and lets the edit win, per-field.
+
+    This keeps the original LLM proposal intact (useful for diffing later
+    and for resetting an edit) and lets multiple admins safely edit
+    concurrently (last-write-wins per field, not per item).
+
+    Returns a dict with the *effective* title / description / content_html /
+    plus an "edited" flag if anything was layered on top.
+    """
+    eff_title       = item_dict.get("title", "")
+    eff_description = item_dict.get("proposed_description") or ""
+    eff_html        = item_dict.get("proposed_html") or ""
+    edited = False
+    generated_for_new_topic = False
+    edited_at = None
+    if edits_for_slug:
+        if edits_for_slug.get("title"):
+            eff_title = edits_for_slug["title"]
+            edited = True
+        if edits_for_slug.get("description") is not None:
+            # Empty string is a legitimate reset
+            eff_description = edits_for_slug["description"]
+            edited = True
+        if edits_for_slug.get("content_html") is not None:
+            eff_html = edits_for_slug["content_html"]
+            edited = True
+        generated_for_new_topic = bool(edits_for_slug.get("generated_for_new_topic"))
+        edited_at = edits_for_slug.get("edited_at")
+    return {
+        "effective_title":       eff_title,
+        "effective_description": eff_description,
+        "effective_html":        eff_html,
+        "edited":                edited,
+        "edited_at":             edited_at,
+        "generated_for_new_topic": generated_for_new_topic,
+    }
+
+
+def _render_pin_section(pins: dict) -> str:
+    """Render the 'Currently pinned' collapsible block at the top of the review."""
+    if not pins:
+        return ""
+    rows = []
+    for slug, info in sorted(pins.items()):
+        pinned_by = _esc(info.get("pinned_by", "unknown"))
+        pinned_at = _esc((info.get("pinned_at") or "")[:19])
+        note      = _esc(info.get("note", ""))
+        rows.append(f"""
+          <li>
+            <code>{_esc(slug)}</code>
+            &nbsp;·&nbsp; pinned by {pinned_by} {pinned_at}
+            {f'&nbsp;·&nbsp; <span class="dim">{note}</span>' if note else ''}
+            <form method="POST" action="/admin/article-sync/unpin" style="display:inline; margin-left:8px;">
+              <input type="hidden" name="slug" value="{_esc(slug)}">
+              <button type="submit" class="btn secondary btn-sm">Unpin</button>
+            </form>
+          </li>
+        """)
+    return f"""
+    <details class="panel" style="margin-bottom:16px;">
+      <summary style="cursor:pointer; font-weight:600;">
+        Currently pinned ({len(pins)})
+      </summary>
+      <p class="dim" style="margin-top:8px;">
+        Pinned slugs are still judged on every sync, but the Publish action is disabled
+        for them in the review below until you Unpin.
+      </p>
+      <ul style="list-style:none; padding-left:0;">
+        {''.join(rows)}
+      </ul>
+    </details>
+    """
+
+
+def _render_update_card(item: dict, edit: Optional[dict], pins: dict, proposal_id: str) -> str:
+    """
+    Render one 'needs_update' or 'unchanged' card.
+
+    Includes: rationale, collapsed current body, editable proposed body,
+    editable description, publish checkbox, pin and save-edits actions.
+    """
+    slug          = item.get("slug", "")
+    eff           = _compose_item(item, edit)
+    is_pinned     = slug in pins
+    pin_info      = pins.get(slug) if is_pinned else None
+
+    rationale     = _esc(item.get("reason") or "")
+    plain_id      = item.get("plain_id") or ""
+    group_name    = item.get("group_name") or ""
+    current_html  = item.get("current_html") or ""
+
+    pin_badge = ""
+    if is_pinned:
+        pin_badge = (
+            f'<span class="badge badge-warn" title="Pinned by '
+            f'{_esc((pin_info or {}).get("pinned_by",""))} '
+            f'{_esc(((pin_info or {}).get("pinned_at","") or "")[:19])}">📌 Pinned</span>'
+        )
+
+    edited_badge = ""
+    if eff["edited"]:
+        edited_at_short = _esc((eff["edited_at"] or "")[:19])
+        edited_badge = f'<span class="badge badge-edit">✏️ Edited {edited_at_short}</span>'
+
+    publish_disabled = "disabled" if is_pinned else ""
+    publish_label_dim = ' style="color:#9b9b9b;"' if is_pinned else ''
+
+    pin_btn_label = "Unpin" if is_pinned else "Pin (don't publish)"
+    pin_btn_action = "/admin/article-sync/unpin" if is_pinned else "/admin/article-sync/pin"
+    pin_btn_class = "btn secondary" if is_pinned else "btn"
+    return f"""
+    <article class="panel async-card" id="card-{_esc(slug)}">
+      <div class="async-card-head">
+        <div>
+          <h3 style="margin:0;">
+            {_esc(eff["effective_title"])}
+          </h3>
+          <div class="dim" style="font-size:13px; margin-top:4px;">
+            <code>{_esc(slug)}</code>
+            {f' · {_esc(group_name)}' if group_name else ''}
+            {f' · Plain ID: <code>{_esc(plain_id)}</code>' if plain_id else ''}
+          </div>
+        </div>
+        <div>
+          {pin_badge} {edited_badge}
+        </div>
+      </div>
+
+      {f'<div class="async-rationale"><strong>LLM rationale:</strong> {rationale}</div>' if rationale else ''}
+
+      {f'''<details style="margin-top:12px;">
+        <summary style="cursor:pointer;" class="dim">▸ show current article body ({len(current_html)} chars)</summary>
+        <div class="async-current">
+          <pre>{_esc(current_html or '(empty)')}</pre>
+        </div>
+      </details>''' if current_html else '<p class="dim" style="margin-top:8px;">No current body in Plain — this would publish as a new article.</p>'}
+
+      <form method="POST" action="/admin/article-sync/edit" class="async-edit-form">
+        <input type="hidden" name="proposal_id" value="{_esc(proposal_id)}">
+        <input type="hidden" name="slug" value="{_esc(slug)}">
+
+        <label class="dim" style="font-size:13px;">Proposed body (editable HTML):</label>
+        <textarea name="content_html" rows="14" class="async-body">{_esc(eff["effective_html"])}</textarea>
+
+        <label class="dim" style="font-size:13px; margin-top:8px;">Proposed description:</label>
+        <input type="text" name="description" value="{_esc(eff["effective_description"])}" maxlength="200">
+
+        <div class="async-card-actions">
+          <button type="submit" class="btn secondary btn-sm">Save my edits</button>
+        </div>
+      </form>
+
+      <div class="async-card-actions" style="margin-top:8px;">
+        <label{publish_label_dim}>
+          <input type="checkbox" name="publish_slugs" value="{_esc(slug)}"
+                 form="bulk-publish-form" {publish_disabled}>
+          <strong>Publish this update</strong>
+          {' <span class="dim">(unpin first)</span>' if is_pinned else ''}
+        </label>
+
+        <form method="POST" action="{pin_btn_action}" style="display:inline;">
+          <input type="hidden" name="slug" value="{_esc(slug)}">
+          <button type="submit" class="{pin_btn_class} btn-sm">{pin_btn_label}</button>
+        </form>
+      </div>
+    </article>
+    """
+
+
+def _render_new_topic_card(item: dict, edit: Optional[dict], proposal_id: str) -> str:
+    """
+    Render one 'new_topic' suggestion card.
+
+    No body proposed by default — the admin has to click "Generate body"
+    to invoke a separate LLM call. After generation, the card mutates to
+    look like an update card with editable body + publish checkbox.
+    """
+    slug       = item.get("slug", "")
+    eff        = _compose_item(item, edit)
+    rationale  = _esc(item.get("reason") or "")
+    group_name = item.get("group_name") or ""
+    has_body   = bool(eff["effective_html"])
+
+    if not has_body:
+        # State A: no body generated yet. Just title + rationale + Generate.
+        return f"""
+        <article class="panel async-card async-newtopic" id="card-{_esc(slug)}">
+          <div class="async-card-head">
+            <div>
+              <h3 style="margin:0;">
+                ✨ {_esc(eff["effective_title"])}
+              </h3>
+              <div class="dim" style="font-size:13px; margin-top:4px;">
+                Suggested category: {_esc(group_name) or '(none)'} · <code>{_esc(slug)}</code>
+              </div>
+            </div>
+          </div>
+
+          {f'<div class="async-rationale"><strong>LLM rationale:</strong> {rationale}</div>' if rationale else ''}
+
+          <div class="async-card-actions" style="margin-top:12px;">
+            <form method="POST" action="/admin/article-sync/generate-body" style="display:inline;">
+              <input type="hidden" name="proposal_id" value="{_esc(proposal_id)}">
+              <input type="hidden" name="slug" value="{_esc(slug)}">
+              <button type="submit" class="btn">Generate body</button>
+            </form>
+            <span class="dim" style="font-size:13px; margin-left:8px;">
+              (one LLM call, ~3-15s)
+            </span>
+          </div>
+        </article>
+        """
+
+    # State B: body has been generated. Render full edit form + publish checkbox.
+    return f"""
+    <article class="panel async-card async-newtopic" id="card-{_esc(slug)}">
+      <div class="async-card-head">
+        <div>
+          <h3 style="margin:0;">✨ {_esc(eff["effective_title"])}</h3>
+          <div class="dim" style="font-size:13px; margin-top:4px;">
+            Suggested category: {_esc(group_name) or '(none)'} · <code>{_esc(slug)}</code>
+          </div>
+        </div>
+        <div>
+          <span class="badge badge-edit">✨ Body generated</span>
+        </div>
+      </div>
+
+      {f'<div class="async-rationale"><strong>LLM rationale:</strong> {rationale}</div>' if rationale else ''}
+
+      <form method="POST" action="/admin/article-sync/edit" class="async-edit-form">
+        <input type="hidden" name="proposal_id" value="{_esc(proposal_id)}">
+        <input type="hidden" name="slug" value="{_esc(slug)}">
+
+        <label class="dim" style="font-size:13px;">Proposed body (editable HTML):</label>
+        <textarea name="content_html" rows="14" class="async-body">{_esc(eff["effective_html"])}</textarea>
+
+        <label class="dim" style="font-size:13px; margin-top:8px;">Proposed description:</label>
+        <input type="text" name="description" value="{_esc(eff["effective_description"])}" maxlength="200">
+
+        <div class="async-card-actions">
+          <button type="submit" class="btn secondary btn-sm">Save my edits</button>
+          <form method="POST" action="/admin/article-sync/generate-body" style="display:inline; margin-left:8px;"
+                onsubmit="return confirm('Regenerate body? Your edits will be replaced.');">
+            <input type="hidden" name="proposal_id" value="{_esc(proposal_id)}">
+            <input type="hidden" name="slug" value="{_esc(slug)}">
+            <button type="submit" class="btn secondary btn-sm">Regenerate</button>
+          </form>
+        </div>
+      </form>
+
+      <div class="async-card-actions" style="margin-top:8px;">
+        <label>
+          <input type="checkbox" name="publish_slugs" value="{_esc(slug)}"
+                 form="bulk-publish-form">
+          <strong>Publish as new article (DRAFT)</strong>
+        </label>
+      </div>
+    </article>
+    """
+
+
+_ARTICLE_SYNC_STYLE = """
+<style>
+  .async-card { margin-bottom:16px; }
+  .async-card-head { display:flex; justify-content:space-between; align-items:flex-start; gap:12px; }
+  .async-rationale {
+    margin-top:10px; padding:10px 12px; border-left:3px solid #805dee;
+    background:#f6f3ff; border-radius:4px; font-size:14px;
+  }
+  .async-newtopic .async-rationale { border-left-color:#ff673c; background:#fff5ef; }
+  .async-current pre {
+    background:#fafafa; padding:10px; border-radius:4px; max-height:200px;
+    overflow:auto; font-size:12px; white-space:pre-wrap; word-break:break-word;
+  }
+  .async-edit-form { margin-top:12px; }
+  .async-body {
+    width:100%; font-family:ui-monospace, Consolas, monospace; font-size:12px;
+    border:1px solid #ddd; border-radius:4px; padding:8px;
+  }
+  .async-card-actions { margin-top:10px; display:flex; gap:8px; align-items:center; flex-wrap:wrap; }
+  .badge { display:inline-block; padding:2px 8px; border-radius:10px; font-size:11px; font-weight:600; }
+  .badge-warn { background:#fff3cd; color:#7a5b00; }
+  .badge-edit { background:#e9e3ff; color:#4a2fc4; }
+  .btn-sm { padding:4px 10px; font-size:13px; }
+  .async-summary-strip {
+    display:flex; gap:20px; flex-wrap:wrap;
+    padding:12px 16px; background:#f6f3ff; border-radius:6px;
+    margin-bottom:16px; font-size:14px;
+  }
+  .async-summary-strip strong { color:#805dee; }
+  #bulk-publish-bar {
+    position:sticky; bottom:0; background:#ffffffee; backdrop-filter:blur(6px);
+    border-top:2px solid #805dee; padding:12px 16px; margin-top:24px;
+    display:flex; justify-content:space-between; align-items:center; gap:12px;
+  }
+</style>
+<script>
+  // Live count of selected articles in the publish bar.
+  document.addEventListener('DOMContentLoaded', () => {
+    const countEl = document.getElementById('publish-count');
+    const submitBtn = document.getElementById('publish-submit');
+    if (!countEl || !submitBtn) return;
+    const update = () => {
+      const checked = document.querySelectorAll('input[name="publish_slugs"]:checked').length;
+      countEl.textContent = checked;
+      submitBtn.disabled = checked === 0;
+      submitBtn.textContent = checked === 0
+        ? 'Select at least one article above'
+        : `Publish ${checked} article${checked === 1 ? '' : 's'} to Plain`;
+    };
+    document.querySelectorAll('input[name="publish_slugs"]').forEach(cb => {
+      cb.addEventListener('change', update);
+    });
+    update();
+  });
+
+  // Confirm for bulk publish at/above threshold.
+  function confirmBulkPublish(ev) {
+    const checked = document.querySelectorAll('input[name="publish_slugs"]:checked').length;
+    if (checked >= __BULK_THRESHOLD__) {
+      if (!confirm(`Publish ${checked} customer-facing articles to Plain? This will push live to help.bankr.bot.`)) {
+        ev.preventDefault();
+        return false;
+      }
+    }
+    return true;
+  }
+</script>
+"""
+
+
+@router.get("/article-sync/review", response_class=HTMLResponse)
+async def article_sync_review(request: Request, _: None = Depends(require_admin)):
+    """
+    Render the proposal-review page. Reads:
+      - Current proposal (article_sync:current → proposal_id → proposal:{id})
+      - Per-item edits (article_sync:edit:{proposal_id}:*)
+      - Pins (article_sync:pinned)
+
+    If there's no current proposal (admin clicked Review before generating
+    one, or proposal expired), shows a friendly empty state with a button
+    to go back to Controls and generate one.
+    """
+    status = await get_article_sync_status()
+    proposal_id = (status or {}).get("proposal_id") if status else None
+
+    proposal = await get_article_sync_proposal(proposal_id) if proposal_id else None
+
+    if not proposal:
+        empty_body = """
+        <a class="btn secondary" href="/admin">← Back to Controls</a>
+        <h2 style="margin-top:16px;">Help Center Sync — Review</h2>
+        <div class="panel" style="margin-top:16px;">
+          <p>No proposal is currently available for review.</p>
+          <p class="dim">
+            Generate one from the Controls page first. A proposal stays available
+            for 7 days after it's generated.
+          </p>
+          <p><a class="btn" href="/admin">Go to Controls</a></p>
+        </div>
+        """
+        return HTMLResponse(_page("Article Sync — Review", empty_body))
+
+    pins  = await get_pins()
+    edits = await get_item_edits(proposal_id)
+
+    items = proposal.get("items") or []
+    # Partition by kind for separate sections in the UI
+    updates  = [i for i in items if i.get("kind") == "needs_update"]
+    unchgd   = [i for i in items if i.get("kind") == "unchanged"]
+    orphans  = [i for i in items if i.get("kind") == "orphan"]
+    newtopic = [i for i in items if i.get("kind") == "new_topic"]
+    errors   = [i for i in items if i.get("kind") == "error"]
+
+    # Build summary strip
+    summary  = proposal.get("summary") or {}
+    tin = proposal.get("tokens_in", 0)
+    tout = proposal.get("tokens_out", 0)
+    gen_at = (proposal.get("generated_at") or "")[:19]
+
+    summary_strip = f"""
+    <div class="async-summary-strip">
+      <div><strong>{len(updates)}</strong> need updates</div>
+      <div><strong>{len(unchgd)}</strong> unchanged</div>
+      <div><strong>{len(newtopic)}</strong> new-topic suggestions</div>
+      <div><strong>{len(orphans)}</strong> orphans</div>
+      {f'<div style="color:#c0392b;"><strong>{len(errors)}</strong> errors</div>' if errors else ''}
+      <div class="dim">·</div>
+      <div class="dim">Generated {_esc(gen_at)} UTC</div>
+      <div class="dim">·</div>
+      <div class="dim">{tin:,} tokens in / {tout:,} out</div>
+    </div>
+    """
+
+    update_cards = "".join(
+        _render_update_card(it, edits.get(it["slug"]), pins, proposal_id) for it in updates
+    ) or '<p class="dim">No articles need updates in this proposal.</p>'
+
+    newtopic_cards = "".join(
+        _render_new_topic_card(it, edits.get(it["slug"]), proposal_id) for it in newtopic
+    ) or '<p class="dim">No new-topic suggestions in this proposal.</p>'
+
+    orphan_section = ""
+    if orphans:
+        orphan_rows = "".join(
+            f'<li><code>{_esc(o.get("slug",""))}</code> — {_esc(o.get("reason",""))}</li>'
+            for o in orphans
+        )
+        orphan_section = f"""
+        <h2 style="margin-top:32px;">⚠️ Orphans ({len(orphans)})</h2>
+        <p class="dim">
+          The LLM thinks these articles are no longer well-represented by the docs.
+          We don't auto-archive — review and decide manually in Plain's UI.
+        </p>
+        <ul class="panel">{orphan_rows}</ul>
+        """
+
+    error_section = ""
+    if errors:
+        error_rows = "".join(
+            f'<li><code>{_esc(e.get("slug",""))}</code> — {_esc(e.get("reason","") or "unknown error")}</li>'
+            for e in errors
+        )
+        error_section = f"""
+        <h2 style="margin-top:32px;">❌ Errors ({len(errors)})</h2>
+        <p class="dim">
+          These items failed during proposal generation. Re-running the sync
+          may resolve transient LLM errors.
+        </p>
+        <ul class="panel">{error_rows}</ul>
+        """
+
+    pin_section = _render_pin_section(pins)
+
+    style_block = _ARTICLE_SYNC_STYLE.replace(
+        "__BULK_THRESHOLD__", str(_BULK_PUBLISH_CONFIRM_THRESHOLD)
+    )
+
+    body = f"""
+    {style_block}
+    <a class="btn secondary" href="/admin">← Back to Controls</a>
+    <h2 style="margin-top:16px;">Help Center Sync — Review</h2>
+    <p class="dim">
+      Proposal <code>{_esc(proposal_id)}</code>
+    </p>
+
+    {summary_strip}
+    {pin_section}
+
+    <h2 style="margin-top:24px;">✏️ Articles needing updates ({len(updates)})</h2>
+    {update_cards}
+
+    <h2 style="margin-top:32px;">✨ New-topic suggestions ({len(newtopic)})</h2>
+    <p class="dim">
+      Suggestions for new articles based on docs sections not covered by the
+      existing {len(items) - len(newtopic)} articles. Bodies are NOT generated
+      by default — click "Generate body" on a card to write one (one LLM call).
+      Reviewing these is the right time to decide if a new article is actually
+      warranted before generating.
+    </p>
+    {newtopic_cards}
+
+    {orphan_section}
+    {error_section}
+
+    <form id="bulk-publish-form" method="POST" action="/admin/article-sync/publish"
+          onsubmit="return confirmBulkPublish(event);">
+      <input type="hidden" name="proposal_id" value="{_esc(proposal_id)}">
+      <div id="bulk-publish-bar">
+        <div>
+          <strong><span id="publish-count">0</span></strong> articles selected to publish
+        </div>
+        <button type="submit" id="publish-submit" class="btn" disabled>
+          Select at least one article above
+        </button>
+      </div>
+    </form>
+    """
+    return HTMLResponse(_page("Article Sync — Review", body))
+
+
+@router.post("/article-sync/pin")
+async def article_sync_pin(request: Request, _: None = Depends(require_admin)):
+    form = await request.form()
+    slug = (form.get("slug") or "").strip()
+    note = (form.get("note") or "").strip()
+    if slug:
+        await set_pin(slug, pinned_by="admin panel", note=note)
+        log.info(f"admin pinned slug={slug!r}")
+    return RedirectResponse(url="/admin/article-sync/review#card-" + slug, status_code=303)
+
+
+@router.post("/article-sync/unpin")
+async def article_sync_unpin(request: Request, _: None = Depends(require_admin)):
+    form = await request.form()
+    slug = (form.get("slug") or "").strip()
+    if slug:
+        await unset_pin(slug)
+        log.info(f"admin unpinned slug={slug!r}")
+    return RedirectResponse(url="/admin/article-sync/review#card-" + slug, status_code=303)
+
+
+@router.post("/article-sync/edit")
+async def article_sync_edit(request: Request, _: None = Depends(require_admin)):
+    """Save per-item edits to a proposal. Persists across page reloads."""
+    form = await request.form()
+    proposal_id  = (form.get("proposal_id") or "").strip()
+    slug         = (form.get("slug") or "").strip()
+    content_html = form.get("content_html")
+    description  = form.get("description")
+    if proposal_id and slug:
+        await save_item_edit(
+            proposal_id, slug,
+            content_html = content_html if content_html is not None else None,
+            description  = description if description is not None else None,
+        )
+        log.info(f"admin saved edits for {proposal_id}/{slug} "
+                 f"({len(content_html or '')} chars body)")
+    return RedirectResponse(url="/admin/article-sync/review#card-" + slug, status_code=303)
+
+
+@router.post("/article-sync/generate-body")
+async def article_sync_generate_body(request: Request, _: None = Depends(require_admin)):
+    """
+    Generate a body for one new-topic suggestion via an LLM call.
+
+    The propose pipeline returns new-topic suggestions with no body to avoid
+    racking up cost on suggestions the admin would have dismissed anyway.
+    This endpoint runs one LLM call per click, on demand. Body persists as
+    a per-item edit so it survives reload.
+
+    Reuses the api_server's already-loaded SemanticDocsManager and a
+    transient LLMRouter to avoid double-loading 65MB of docs.
+    """
+    form = await request.form()
+    proposal_id = (form.get("proposal_id") or "").strip()
+    slug        = (form.get("slug") or "").strip()
+    if not (proposal_id and slug):
+        return RedirectResponse(url="/admin/article-sync/review", status_code=303)
+
+    proposal = await get_article_sync_proposal(proposal_id)
+    if not proposal:
+        return RedirectResponse(url="/admin/article-sync/review", status_code=303)
+
+    item = next(
+        (i for i in (proposal.get("items") or []) if i.get("slug") == slug
+         and i.get("kind") == "new_topic"),
+        None,
+    )
+    if not item:
+        log.warning(f"generate-body: no new_topic item with slug={slug!r}")
+        return RedirectResponse(url="/admin/article-sync/review#card-" + slug, status_code=303)
+
+    # Pull the shared SemanticDocsManager off the api_server app state.
+    # (api_server.lifespan stashes it there so we don't reload chroma in this request.)
+    docs_manager = getattr(request.app.state, "docs_manager", None)
+    if docs_manager is None:
+        log.error("generate-body: docs_manager missing from app.state")
+        return RedirectResponse(url="/admin/article-sync/review#card-" + slug, status_code=303)
+
+    from article_sync import generate_new_topic_body
+    from llm_router import LLMRouter
+    result = await generate_new_topic_body(
+        docs_manager=docs_manager,
+        title=item.get("title") or slug,
+        category=item.get("group_name") or "",
+        router=LLMRouter(),
+    )
+    if result.get("ok"):
+        await save_item_edit(
+            proposal_id, slug,
+            title        = result["title"],
+            description  = result["description"],
+            content_html = result["content_html"],
+            generated_for_new_topic=True,
+        )
+        log.info(f"generate-body: ok for {slug} "
+                 f"({result['tokens_in']} in / {result['tokens_out']} out)")
+    else:
+        log.error(f"generate-body: failed for {slug}: {result.get('error')}")
+    return RedirectResponse(url="/admin/article-sync/review#card-" + slug, status_code=303)
+
+
+@router.post("/article-sync/publish")
+async def article_sync_publish(request: Request, _: None = Depends(require_admin)):
+    """
+    Push selected items to Plain. Composes edits onto the proposal first,
+    runs publish_items, saves a result record, redirects to results page.
+    """
+    form = await request.form()
+    proposal_id  = (form.get("proposal_id") or "").strip()
+    selected     = form.getlist("publish_slugs")
+    if not (proposal_id and selected):
+        return RedirectResponse(url="/admin/article-sync/review", status_code=303)
+
+    proposal = await get_article_sync_proposal(proposal_id)
+    if not proposal:
+        return RedirectResponse(url="/admin/article-sync/review", status_code=303)
+
+    edits = await get_item_edits(proposal_id)
+    pins  = await get_pins()
+
+    # Build per-slug index of items for lookup
+    items_by_slug = {i["slug"]: i for i in (proposal.get("items") or [])}
+
+    from article_sync import PublishItem, publish_items
+    from plain_client import PlainClient
+    import plain_articles
+
+    publish_set: list[PublishItem] = []
+    skipped: list[dict] = []  # tracked for the results page
+    for slug in selected:
+        if slug in pins:
+            # Defense-in-depth — checkbox should already be disabled, but
+            # never trust the client.
+            skipped.append({"slug": slug, "ok": False, "is_new": False,
+                            "plain_id_after": items_by_slug.get(slug, {}).get("plain_id"),
+                            "error": "Slug is pinned — refused at backend."})
+            continue
+        item = items_by_slug.get(slug)
+        if not item:
+            skipped.append({"slug": slug, "ok": False, "is_new": False,
+                            "plain_id_after": None,
+                            "error": "Slug not found in proposal."})
+            continue
+        eff = _compose_item(item, edits.get(slug))
+        is_new = (item.get("kind") == "new_topic")
+        # For new-topic publishing, ensure a body actually got generated
+        # (otherwise we'd publish an empty article).
+        if is_new and not eff["effective_html"]:
+            skipped.append({"slug": slug, "ok": False, "is_new": True,
+                            "plain_id_after": None,
+                            "error": "New-topic body not generated — click Generate body first."})
+            continue
+        publish_set.append(PublishItem(
+            slug         = slug,
+            title        = eff["effective_title"],
+            content_html = eff["effective_html"],
+            is_new       = is_new,
+            plain_id     = item.get("plain_id") if not is_new else None,
+            description  = eff["effective_description"] or None,
+            group_id     = item.get("group_id") or None,
+        ))
+
+    plain_client = PlainClient()
+    started_at = datetime.now(timezone.utc).isoformat()
+    upsert_results = await publish_items(plain_client=plain_client, items=publish_set)
+    finished_at = datetime.now(timezone.utc).isoformat()
+
+    run_id = "run_" + datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    await save_publish_result(run_id, {
+        "run_id":      run_id,
+        "proposal_id": proposal_id,
+        "started_at":  started_at,
+        "finished_at": finished_at,
+        "items":       skipped + upsert_results,
+    })
+    log.info(
+        f"article-sync publish run={run_id}: "
+        f"{sum(1 for r in upsert_results if r['ok'])} ok / "
+        f"{sum(1 for r in upsert_results if not r['ok'])} fail / "
+        f"{len(skipped)} skipped"
+    )
+    return RedirectResponse(url=f"/admin/article-sync/results/{run_id}", status_code=303)
+
+
+@router.get("/article-sync/results/{run_id}", response_class=HTMLResponse)
+async def article_sync_results(run_id: str, request: Request, _: None = Depends(require_admin)):
+    """Show per-article ✅/❌ for a publish run."""
+    result = await get_publish_result(run_id)
+    if not result:
+        body = f"""
+        <a class="btn secondary" href="/admin/article-sync/review">← Back to review</a>
+        <h2 style="margin-top:16px;">Article Sync — Publish results</h2>
+        <div class="panel" style="margin-top:16px;">
+          <p>No record of run <code>{_esc(run_id)}</code>.</p>
+          <p class="dim">Results are kept for 7 days. This one may have expired.</p>
+        </div>
+        """
+        return HTMLResponse(_page("Article Sync — Results", body))
+
+    items   = result.get("items") or []
+    n_ok    = sum(1 for i in items if i.get("ok"))
+    n_fail  = sum(1 for i in items if not i.get("ok"))
+    started = (result.get("started_at")  or "")[:19]
+    ended   = (result.get("finished_at") or "")[:19]
+
+    rows = []
+    for it in items:
+        slug = _esc(it.get("slug", ""))
+        ok = it.get("ok")
+        is_new = it.get("is_new")
+        icon = "✅" if ok else "❌"
+        kind = "<em>new</em>" if is_new else "update"
+        msg = ""
+        if ok:
+            pid = _esc(it.get("plain_id_after") or "")
+            msg = f'<code>{pid}</code>' if pid else ''
+        else:
+            msg = f'<span style="color:#c0392b;">{_esc(it.get("error",""))}</span>'
+        rows.append(f"""
+          <tr>
+            <td style="font-size:18px;">{icon}</td>
+            <td><code>{slug}</code></td>
+            <td>{kind}</td>
+            <td>{msg}</td>
+          </tr>
+        """)
+
+    body = f"""
+    <a class="btn secondary" href="/admin/article-sync/review">← Back to review</a>
+    <h2 style="margin-top:16px;">Article Sync — Publish results</h2>
+    <p class="dim">
+      Run <code>{_esc(run_id)}</code> · started {_esc(started)} → {_esc(ended)} UTC
+    </p>
+    <div class="async-summary-strip">
+      <div><strong>{n_ok}</strong> succeeded</div>
+      <div>{'<strong style="color:#c0392b;">'+str(n_fail)+'</strong> failed' if n_fail else f'<strong>{n_fail}</strong> failed'}</div>
+    </div>
+    <div class="panel">
+      <table style="width:100%; border-collapse:collapse;">
+        <thead>
+          <tr style="border-bottom:1px solid #ddd; text-align:left;">
+            <th style="width:32px;"></th>
+            <th>Slug</th>
+            <th style="width:80px;">Kind</th>
+            <th>Result</th>
+          </tr>
+        </thead>
+        <tbody>
+          {''.join(rows)}
+        </tbody>
+      </table>
+    </div>
+    <p style="margin-top:24px;">
+      <a class="btn" href="/admin">Back to Controls</a>
+      <a class="btn secondary" href="/admin/article-sync/review">Back to review</a>
+    </p>
+    """
+    return HTMLResponse(_page("Article Sync — Results", body))

@@ -28,6 +28,7 @@ ENV vars:
 import asyncio
 import logging
 import os
+from datetime import datetime, timezone
 from typing import Optional
 
 from dotenv import load_dotenv
@@ -39,7 +40,13 @@ import uvicorn
 
 from shared import SemanticDocsManager, OllamaClient
 from llm_router import LLMRouter
-from redis_pubsub import listen_for_reindex, set_reindex_status
+from plain_client import PlainClient
+from redis_pubsub import (
+    listen_for_reindex, set_reindex_status,
+    listen_for_article_sync, set_article_sync_status,
+    save_article_sync_proposal,
+)
+import article_sync
 import db
 
 load_dotenv()
@@ -68,6 +75,11 @@ async def lifespan(app: FastAPI):
     log.info("API server starting — pre-loading docs...")
     await docs.ensure_ready()
     log.info("Docs ready.")
+    # Stash on app.state so the admin panel's article-sync routes can reach
+    # the same already-loaded docs manager (avoids reloading 65MB of docs
+    # per "generate body" click). Same instance the /query endpoint uses.
+    app.state.docs_manager = docs
+    app.state.llm_router   = ollama
     await db.init_db()  # no-op if DATABASE_URL is unset
 
     # Listen for manual docs re-index signals from the admin panel.
@@ -85,9 +97,58 @@ async def lifespan(app: FastAPI):
 
     reindex_task = asyncio.ensure_future(listen_for_reindex(_on_reindex_signal))
 
+    # Listen for manual help-center article-sync signals from the admin panel.
+    # Same pattern as reindex above, but here the worker runs the propose
+    # pipeline and stashes the resulting proposal in Redis for the review
+    # page to render. No writes to Plain happen here — those are gated
+    # behind the admin's explicit Publish click on the review page.
+    async def _on_article_sync_signal(triggered_by: str):
+        proposal_id = datetime.now(timezone.utc).strftime("prop_%Y%m%dT%H%M%SZ")
+        try:
+            plain_api_key = os.getenv("PLAIN_API_KEY", "")
+            if not plain_api_key:
+                await set_article_sync_status(
+                    "failed",
+                    detail="PLAIN_API_KEY not set in api service env",
+                )
+                return
+            # Use the docs manager that's already loaded — same instance the
+            # /query endpoint uses, so we don't re-fetch.
+            plain = PlainClient(plain_api_key)
+            proposal = await article_sync.propose(
+                docs_manager=docs,
+                plain_client=plain,
+                router=ollama,
+            )
+            ok = await save_article_sync_proposal(proposal_id, proposal.to_dict())
+            if not ok:
+                await set_article_sync_status(
+                    "failed",
+                    detail="Proposal generated but could not be stored",
+                )
+                return
+            summary = proposal.summary or {}
+            detail = (
+                f"{summary.get('needs_update', 0)} update(s), "
+                f"{summary.get('new_topics', 0)} new, "
+                f"{summary.get('orphans', 0)} orphan(s), "
+                f"{summary.get('errors', 0)} error(s) "
+                f"— by {triggered_by}"
+            )
+            await set_article_sync_status("ready", detail=detail, proposal_id=proposal_id)
+            log.info(f"Article-sync proposal {proposal_id} ready: {detail}")
+        except Exception as e:
+            log.error(f"Article-sync run failed: {e}")
+            await set_article_sync_status("failed", detail=str(e)[:200])
+
+    article_sync_task = asyncio.ensure_future(
+        listen_for_article_sync(_on_article_sync_signal)
+    )
+
     yield
     # shutdown
     reindex_task.cancel()
+    article_sync_task.cancel()
     await db.close_db()
 
 

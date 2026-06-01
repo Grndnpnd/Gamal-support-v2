@@ -1,0 +1,857 @@
+"""
+article_sync.py
+---------------
+The propose-side of the help-center article sync feature.
+
+Two passes, each optimized for its own job:
+
+  Pass 1 — Freshness check (per existing article)
+    For each of the 22 mapped articles, use SemanticDocsManager to find
+    the docs chunks most relevant to that article's title, then ask the
+    LLM whether the article still reflects the docs. Output:
+      unchanged / needs_update / orphan
+    The LLM also writes a new article body when needs_update.
+
+  Pass 2 — Gap detection (across the docs)
+    Take the docs' real top-level structure (the H2 headers, filtered to
+    skip code-block noise and placeholder examples). Ask the LLM, in a
+    single structured call, whether each docs section is meaningfully
+    covered by the 22 existing articles. Output: a list of suggested
+    new articles for human review.
+
+WHY THIS SHAPE
+  Bankr's llms-full.txt is a 548k-char concatenation with ~1600 markdown
+  headers, many inside code blocks and many as inline-example placeholders
+  like 'My Skill'. Section-diff approaches that assume clean hierarchy
+  collapse against this format. Pass 1 doesn't care about doc structure —
+  it asks "what's relevant to this article?" and lets ChromaDB answer.
+  Pass 2 uses structure but only at the level Bankr actually maintains
+  cleanly (H2), with filtering for the known noise.
+
+  We dropped the "skip if docs unchanged since last sync" optimization
+  that diff-based proposing offered. Sync runs infrequently and quality
+  matters more than cost — explicit choice by the admin.
+
+NO WRITES TO PLAIN HERE. Returns a Proposal dict. Stage 3 (review/publish
+UI) is what actually upserts.
+
+NEVER RAISES on a per-article failure — that one article's item is marked
+kind='error' and the run continues, so one bad LLM response doesn't kill
+the whole batch.
+"""
+
+import asyncio
+import json
+import logging
+import re
+import hashlib
+from dataclasses import dataclass, field, asdict
+from datetime import datetime, timezone
+from typing import Optional
+
+from llm_router import LLMRouter
+from llm_response import LLMResponse
+from plain_client import PlainClient
+from shared import SemanticDocsManager
+import plain_articles
+
+log = logging.getLogger(__name__)
+
+
+# ─── Proposal data classes ───────────────────────────────────────────────────
+
+@dataclass
+class ProposalItem:
+    """One row in the review UI."""
+    kind:          str                       # see below
+    slug:          str
+    title:         str
+    plain_id:      Optional[str] = None
+    group_id:      str = ""
+    group_name:    str = ""
+    current_html:  Optional[str] = None
+    proposed_html: Optional[str] = None
+    proposed_description: Optional[str] = None
+    reason:        str = ""
+    docs_excerpt:  Optional[str] = None
+
+# kind values:
+#   "unchanged"     article still reflects the docs — no action needed
+#   "needs_update"  article should be rewritten; proposed_html is the new body
+#   "orphan"        article's topic is no longer well-represented in docs
+#                   (human review only — we do not auto-archive)
+#   "new_topic"     suggested new article — for review only, no proposed_html
+#                   because we don't auto-generate new article bodies yet
+#   "error"         the LLM step failed for this item; surfaced so the
+#                   admin can re-run or skip
+
+
+@dataclass
+class Proposal:
+    decision:     str
+    summary:      dict = field(default_factory=dict)
+    docs_hash:    str = ""
+    items:        list[ProposalItem] = field(default_factory=list)
+    generated_at: str = ""
+    tokens_in:    int = 0
+    tokens_out:   int = 0
+    error:        Optional[str] = None
+    notes:        list[str] = field(default_factory=list)    # diagnostics
+
+    def to_dict(self) -> dict:
+        return asdict(self)
+
+
+# ─── Header parser (Pass 2 input prep) ───────────────────────────────────────
+#
+# We deliberately only look at H1 and H2 because the docs are inconsistent
+# below that, AND we filter aggressively to skip the known noise patterns:
+#   - headers inside ``` code fences (the docs concatenator includes them)
+#   - headers that look like example placeholders ('My Skill', 'Your X')
+#   - headers that look like JSON output ('→ {...}')
+#   - headers that look like sequential step titles ('Step 1 — ...', '1. ...')
+
+_HEADER_RE = re.compile(r"^(#{1,2})\s+(.+?)\s*$", re.MULTILINE)
+
+# Patterns that look like an H1/H2 but aren't a real section topic.
+_NOISE_PATTERNS = [
+    re.compile(r"^\s*my\s+(skill|workflow|task|agent|project)\b", re.IGNORECASE),
+    re.compile(r"^\s*your\s+\w+\s+name\b", re.IGNORECASE),
+    re.compile(r"^\s*→"),
+    re.compile(r"^\s*\{"),
+    re.compile(r"^\s*step\s+\d+[\s—:.-]", re.IGNORECASE),
+    re.compile(r"^\s*\d+\.\s"),                          # numbered list items
+    re.compile(r"^\s*(option|example)\s+\d+", re.IGNORECASE),
+    re.compile(r"^\s*(interactive|headless|with\s+fee)", re.IGNORECASE),
+    re.compile(r"^\s*(send|set|claim|scan|log\s+in)\s", re.IGNORECASE),
+]
+
+
+def _strip_code_blocks(text: str) -> str:
+    """
+    Remove fenced code blocks so headers inside them don't get parsed as
+    real sections. We do this *before* header regex matches.
+    """
+    return re.sub(r"```.*?```", "", text, flags=re.DOTALL)
+
+
+def _is_noise_header(text: str) -> bool:
+    """True if a header looks like a code example or step title, not a real section."""
+    if len(text) > 80:
+        return True   # real section names are short; long ones are usually inline
+    for p in _NOISE_PATTERNS:
+        if p.match(text):
+            return True
+    return False
+
+
+def extract_topical_sections(docs_text: str) -> list[dict]:
+    """
+    Return a list of { header, level, body } for sections that look like
+    real docs topics (filtered to drop the known noise).
+
+    Used by Pass 2 to give the LLM a structural overview of the docs.
+    Body is truncated to ~600 chars per section so the full list fits
+    comfortably in one LLM call.
+    """
+    cleaned = _strip_code_blocks(docs_text)
+    matches = list(_HEADER_RE.finditer(cleaned))
+    sections: list[dict] = []
+    for i, m in enumerate(matches):
+        level = len(m.group(1))
+        text = m.group(2).strip()
+        if _is_noise_header(text):
+            continue
+        start = m.end()
+        end = matches[i + 1].start() if i + 1 < len(matches) else len(cleaned)
+        body = cleaned[start:end].strip()
+        sections.append({
+            "header": text,
+            "level": level,
+            "body_preview": body[:600],
+        })
+    return sections
+
+
+# ─── House voice (the prompts reference this) ────────────────────────────────
+
+_HOUSE_VOICE = """\
+HOUSE VOICE & STYLE — Bankr help center articles
+
+- Plain language, not developer docs. Write like you're explaining to a
+  smart friend, not a developer reading an API reference.
+- Title is a real user question: "How Do I Place a Trade?" not "Trading
+  Documentation."
+- The title goes in the JSON "title" field, NEVER inside the contentHtml.
+  Do not put <h1> at the start of contentHtml — the title is rendered
+  separately by the help center. Starting contentHtml with <h1> creates a
+  duplicate heading on the published page. Start the body with the first
+  real content paragraph (a <p>) or an intro <h2> for a subsection.
+- Practical numbered steps the user can follow.
+- Include example prompts the user can copy/paste into Bankr where useful.
+- Link to docs.bankr.bot at the end for technical deep-dives.
+- Common troubleshooting tips where relevant.
+- Code examples minimal — only when truly necessary.
+- Tone: friendly, direct, confident — like a knowledgeable friend. Not
+  corporate, not overly casual.
+- Output HTML, not markdown. Use simple, semantic HTML: <p>, <ol>, <ul>,
+  <li>, <h2>, <h3>, <strong>, <em>, <code>, <pre><code>...</code></pre>,
+  <a href="...">. No <div>, no inline styles, no scripts."""
+
+
+# ─── Robust JSON parse (handles chatty models like GLM) ──────────────────────
+
+def _sanitize_proposed_html(html: str) -> str:
+    """
+    Defense-in-depth cleanup for LLM-generated article bodies.
+
+    The LLM is told (twice — in the house-voice block and in the write
+    prompt) not to put the article title in the body, because Plain renders
+    the title field separately above the body. Despite that, some runs
+    still produce contentHtml that starts with an <h1>Title</h1> tag, which
+    creates a duplicate heading on the published page.
+
+    This function strips a leading <h1>…</h1> if present. Only the *first*
+    one, only if it's at the very start (after optional whitespace), so we
+    don't accidentally remove a meaningful sub-heading deeper in the body.
+    The article's title is carried separately in ProposalItem.title.
+    """
+    if not html:
+        return html
+    # Match a leading <h1>...</h1> with optional surrounding whitespace
+    return re.sub(
+        r"^\s*<h1[^>]*>.*?</h1>\s*",
+        "",
+        html,
+        count=1,
+        flags=re.IGNORECASE | re.DOTALL,
+    )
+
+
+def _extract_json_object(text: str) -> Optional[dict]:
+    """
+    Pull a JSON object out of LLM output that may include preamble prose,
+    markdown fences, or both. Returns the parsed dict, or None if no valid
+    JSON object can be found.
+
+    Strategy:
+      1. Strip ```json / ``` fences if present.
+      2. Try to parse the whole thing as JSON.
+      3. If that fails, find the first '{' and try to parse from there to
+         the matching balanced '}'. Handles "Looking at the changes... { ... }"
+         style chatty model output.
+    """
+    if not text:
+        return None
+    t = text.strip()
+    # 1. strip markdown fences (with or without language tag)
+    t = re.sub(r"^```(?:json|JSON)?\s*", "", t)
+    t = re.sub(r"\s*```\s*$", "", t)
+    # 2. straight parse
+    try:
+        return json.loads(t)
+    except json.JSONDecodeError:
+        pass
+    # 3. find first balanced object
+    start = t.find("{")
+    while start != -1:
+        depth = 0
+        in_string = False
+        escape = False
+        for i in range(start, len(t)):
+            c = t[i]
+            if escape:
+                escape = False
+                continue
+            if c == "\\":
+                escape = True
+                continue
+            if c == '"':
+                in_string = not in_string
+                continue
+            if in_string:
+                continue
+            if c == "{":
+                depth += 1
+            elif c == "}":
+                depth -= 1
+                if depth == 0:
+                    candidate = t[start : i + 1]
+                    try:
+                        return json.loads(candidate)
+                    except json.JSONDecodeError:
+                        break
+        # try next opening brace if the current one didn't yield valid JSON
+        start = t.find("{", start + 1)
+    return None
+
+
+# ─── Pass 1: Freshness check (per article) ───────────────────────────────────
+
+def _pass1_system_prompt() -> str:
+    return f"""You are reviewing one Bankr help center article against the most relevant chunks of the current Bankr documentation.
+
+You will receive:
+- The article's current title, slug, category, and HTML body.
+- The 6-8 documentation excerpts that were retrieved as the most semantically
+  relevant to this article's topic.
+
+Decide which one of these applies to this article:
+- "unchanged"    — the current article still accurately reflects the docs.
+                   Pick this if differences are cosmetic (whitespace, ordering,
+                   small wording) — only flag substantive content drift.
+- "needs_update" — the docs cover this topic but the article is missing
+                   information, has outdated information, or could be
+                   meaningfully better. Be honest but conservative — false
+                   positives waste reviewer time.
+- "orphan"       — the retrieved docs are weak matches (the article's topic
+                   isn't really documented anymore, OR the article is about
+                   something Bankr no longer does). The reviewer will look at
+                   this manually.
+
+If you pick "needs_update", ALSO produce the full new article: a title (real
+user question), a one-sentence description for search, and the HTML body.
+
+{_HOUSE_VOICE}
+
+Respond ONLY with a single JSON object. No preamble, no markdown fence:
+{{
+  "decision":  "unchanged" | "needs_update" | "orphan",
+  "reason":    "one or two sentences explaining the decision",
+  "new_article": null  OR  {{
+    "title":       "How Do I ...?",
+    "description": "One-sentence summary for search.",
+    "contentHtml": "<p>...</p><ol><li>...</li></ol>..."
+  }}
+}}
+"""
+
+
+async def _judge_one_article(
+    router: LLMRouter,
+    article_entry: dict,
+    current_plain: Optional[dict],
+    docs_chunks: list[dict],
+) -> dict:
+    """
+    Run Pass 1 for one article. Returns:
+      {
+        "decision":   "unchanged" | "needs_update" | "orphan" | "error",
+        "reason":     str,
+        "new_article": dict | None,
+        "tokens_in":  int,
+        "tokens_out": int,
+      }
+    """
+    current_html = (current_plain or {}).get("contentHtml") or ""
+    # Use the article's current title + slug + group as the search subject
+    user_payload = {
+        "article": {
+            "slug":         article_entry["slug"],
+            "current_title": (current_plain or {}).get("title") or article_entry["title"],
+            "category":     article_entry["group_name"],
+            "current_html": current_html,
+        },
+        "relevant_docs_chunks": [
+            {"chunk_index": c.get("index"), "text": c["text"]}
+            for c in docs_chunks
+        ],
+    }
+    resp: LLMResponse = await router.chat(
+        messages=[{"role": "user", "content": json.dumps(user_payload, ensure_ascii=False)}],
+        system=_pass1_system_prompt(),
+        temperature=0.15,
+    )
+    tin  = getattr(resp, "tokens_in", 0) or 0
+    tout = getattr(resp, "tokens_out", 0) or 0
+    ok   = getattr(resp, "ok", True)
+    if not ok:
+        return {"decision": "error", "reason": "LLM call failed",
+                "new_article": None, "tokens_in": tin, "tokens_out": tout}
+
+    parsed = _extract_json_object(str(resp))
+    if not parsed or "decision" not in parsed:
+        log.error(
+            f"Pass1 LLM returned unparseable output for {article_entry['slug']}: "
+            f"{str(resp)[:200]!r}"
+        )
+        return {"decision": "error", "reason": "LLM returned unparseable output",
+                "new_article": None, "tokens_in": tin, "tokens_out": tout}
+
+    decision = parsed.get("decision", "unchanged")
+    if decision not in ("unchanged", "needs_update", "orphan"):
+        decision = "unchanged"
+    return {
+        "decision":   decision,
+        "reason":     str(parsed.get("reason", "")).strip(),
+        "new_article": parsed.get("new_article") if decision == "needs_update" else None,
+        "tokens_in":  tin,
+        "tokens_out": tout,
+    }
+
+
+# ─── Pass 2: Gap detection (one call across the whole docs) ──────────────────
+
+def _pass2_system_prompt() -> str:
+    return f"""You are reviewing the structural top-level sections of the Bankr documentation against the current set of 22 help center article titles.
+
+Your job: identify any documentation sections that describe a meaningful topic NOT covered by any existing help center article — these are candidates for new articles.
+
+You will receive:
+- A list of documentation sections (header + short body preview).
+- A list of the 22 existing help center article titles and their categories.
+
+For each docs section, decide whether the topic is already covered by an
+existing article. If multiple sections describe one new topic, fold them
+into one new-article suggestion.
+
+Be conservative. Most sections are likely covered already, since the 22
+articles span the main user-facing surface area of Bankr. Only suggest a
+new article when:
+- The docs describe a feature or topic that no existing article covers
+- The topic is distinct enough that a user would search for it separately
+  (not just one paragraph inside a broader topic)
+- The topic is something a customer would care about (not internal,
+  not developer-only API minutiae)
+
+{_HOUSE_VOICE}
+
+Respond ONLY with a single JSON object. No preamble, no markdown fence:
+{{
+  "new_article_suggestions": [
+    {{
+      "suggested_slug":   "kebab-case-slug",
+      "suggested_title":  "How Do I ...?",
+      "suggested_category": "Getting Started" | "Trading & Orders" | "Wallet & Portfolio" | "Token Launching" | "Automations" | "Bankr Club & Billing" | "Apps & Extensions" | "Security" | "Troubleshooting",
+      "reason":           "One-line rationale. Reference which docs section(s) prompted this.",
+      "docs_sections":    ["Section header 1", "Section header 2"]
+    }}
+  ]
+}}
+
+If no new articles are warranted, return: {{ "new_article_suggestions": [] }}.
+"""
+
+
+async def _detect_gaps(
+    router: LLMRouter,
+    docs_sections: list[dict],
+    existing_articles: list[dict],
+) -> tuple[list[dict], int, int]:
+    """
+    Run Pass 2. Returns (suggestions, tokens_in, tokens_out).
+    """
+    user_payload = {
+        "existing_articles": [
+            {"title": a["title"], "slug": a["slug"], "category": a["group_name"]}
+            for a in existing_articles
+        ],
+        "docs_sections": [
+            {"header": s["header"], "level": s["level"], "body_preview": s["body_preview"]}
+            for s in docs_sections
+        ],
+    }
+    resp: LLMResponse = await router.chat(
+        messages=[{"role": "user", "content": json.dumps(user_payload, ensure_ascii=False)}],
+        system=_pass2_system_prompt(),
+        temperature=0.15,
+    )
+    tin  = getattr(resp, "tokens_in", 0) or 0
+    tout = getattr(resp, "tokens_out", 0) or 0
+    ok   = getattr(resp, "ok", True)
+    if not ok:
+        log.error("Pass2 LLM call failed")
+        return [], tin, tout
+
+    parsed = _extract_json_object(str(resp))
+    if not parsed:
+        log.error(f"Pass2 LLM returned unparseable output: {str(resp)[:300]!r}")
+        return [], tin, tout
+
+    suggestions = parsed.get("new_article_suggestions") or []
+    if not isinstance(suggestions, list):
+        log.error("Pass2 LLM returned non-list new_article_suggestions")
+        return [], tin, tout
+    return suggestions, tin, tout
+
+
+# ─── Pipeline entry point ────────────────────────────────────────────────────
+
+async def propose(
+    *,
+    docs_manager: SemanticDocsManager,
+    plain_client: PlainClient,
+    router: Optional[LLMRouter] = None,
+    docs_top_k: int = 8,
+) -> Proposal:
+    """
+    Run the two-pass propose pipeline end to end.
+
+    Args:
+      docs_manager  - the SemanticDocsManager the caller has already prepared
+                      (await ensure_ready() before passing). We use it for
+                      both Pass 1 (semantic chunks per article) and Pass 2
+                      (raw_content for structural section extraction).
+      plain_client  - authenticated PlainClient. We only read; no writes here.
+      router        - LLMRouter. Defaults to a fresh LLMRouter().
+      docs_top_k    - chunks to retrieve per article for Pass 1. Default 8.
+
+    Returns: Proposal (see dataclass). Never raises — per-article failures
+    are captured as kind='error' items.
+    """
+    started_at = datetime.now(timezone.utc).isoformat()
+    router = router or LLMRouter()
+    notes: list[str] = []
+    total_in = 0
+    total_out = 0
+
+    # ── Sanity check the docs ─────────────────────────────────────────────
+    docs_text = docs_manager.raw_content
+    if not docs_text:
+        return Proposal(
+            decision="error",
+            generated_at=started_at,
+            error="Docs not loaded — call docs_manager.ensure_ready() before propose().",
+        )
+    docs_hash = hashlib.sha256(docs_text.encode("utf-8")).hexdigest()
+
+    # ── Fetch current Plain article state ────────────────────────────────
+    plain_arts = await plain_client.get_help_center_articles(plain_articles.HELP_CENTER_ID)
+    if plain_arts is None:
+        return Proposal(
+            decision="error",
+            generated_at=started_at,
+            docs_hash=docs_hash,
+            error="Failed to fetch articles from Plain — see logs.",
+        )
+    plain_by_slug = {a["slug"]: a for a in plain_arts}
+    notes.append(f"Fetched {len(plain_arts)} live article(s) from Plain.")
+
+    # Bootstrap the article-map's hca_NEEDS_LOOKUP placeholders by matching
+    # slugs to live Plain article IDs. We don't mutate the file — we just
+    # carry the resolved IDs on the Proposal so a follow-up commit can
+    # update plain_articles.py.
+    resolved = plain_articles.resolve_missing_ids_from_live(plain_arts)
+    if resolved:
+        notes.append(
+            f"Resolved {len(resolved)} placeholder article ID(s) from live Plain: "
+            + ", ".join(f"{s}→{i}" for s, i in resolved.items())
+        )
+
+    # ── PASS 1: Freshness check, per article ─────────────────────────────
+    log.info("Pass 1: judging freshness of each of 22 articles...")
+
+    async def _judge_with_chunks(entry):
+        # Build a search query that semantically retrieves docs relevant to
+        # this article: title + category usually gets richer results than
+        # title alone because category disambiguates ("how do I trade" vs
+        # "how do I trade on Polymarket").
+        query = f"{entry['title']} ({entry['group_name']})"
+        chunks = await docs_manager.query_chunks(query, top_k=docs_top_k)
+        result = await _judge_one_article(
+            router,
+            entry,
+            plain_by_slug.get(entry["slug"]),
+            chunks,
+        )
+        return entry, chunks, result
+
+    # Bound concurrency so we don't fire 22 LLM calls in parallel and trip
+    # rate limits on Bankr or Ollama Cloud. 3 at a time is plenty fast and
+    # very polite.
+    sem = asyncio.Semaphore(3)
+
+    async def _bounded(entry):
+        async with sem:
+            return await _judge_with_chunks(entry)
+
+    pass1_results = await asyncio.gather(*[
+        _bounded(e) for e in plain_articles.iter_articles()
+    ])
+
+    items: list[ProposalItem] = []
+    for entry, chunks, result in pass1_results:
+        total_in  += result["tokens_in"]
+        total_out += result["tokens_out"]
+
+        # Resolve the Plain ID — either from the article-map, or from the
+        # bootstrap resolution against live data, or from the per-slug fetch.
+        plain_id = entry["plain_id"]
+        if plain_id == "hca_NEEDS_LOOKUP":
+            plain_id = resolved.get(entry["slug"]) or (
+                plain_by_slug.get(entry["slug"]) or {}
+            ).get("id")
+        current_html = (plain_by_slug.get(entry["slug"]) or {}).get("contentHtml")
+        # Best chunk's text serves as a docs_excerpt preview in the review UI
+        excerpt = (chunks[0]["text"][:400] + "…") if chunks else None
+
+        decision = result["decision"]
+        new_article = result.get("new_article") or {}
+        raw_html = new_article.get("contentHtml")
+
+        item = ProposalItem(
+            kind=decision,
+            slug=entry["slug"],
+            title=str(new_article.get("title") or entry["title"]),
+            plain_id=plain_id,
+            group_id=entry["group_id"],
+            group_name=entry["group_name"],
+            current_html=current_html,
+            # Strip any leading <h1>Title</h1> the LLM may have included
+            # despite the prompt — see _sanitize_proposed_html docstring.
+            proposed_html=_sanitize_proposed_html(str(raw_html)) if raw_html else None,
+            proposed_description=str(new_article.get("description")) if new_article.get("description") else None,
+            reason=result.get("reason", ""),
+            docs_excerpt=excerpt,
+        )
+        items.append(item)
+
+    # ── PASS 2: Gap detection ────────────────────────────────────────────
+    log.info("Pass 2: scanning docs for topics not covered by existing articles...")
+    sections = extract_topical_sections(docs_text)
+    notes.append(
+        f"Filtered docs to {len(sections)} topical H1/H2 section(s) "
+        f"(from raw 1,000+ headers; dropped code-block + placeholder noise)."
+    )
+    suggestions, p2_in, p2_out = await _detect_gaps(
+        router,
+        docs_sections=sections,
+        existing_articles=list(plain_articles.iter_articles()),
+    )
+    total_in  += p2_in
+    total_out += p2_out
+
+    for sug in suggestions:
+        items.append(ProposalItem(
+            kind="new_topic",
+            slug=str(sug.get("suggested_slug") or ""),
+            title=str(sug.get("suggested_title") or ""),
+            group_name=str(sug.get("suggested_category") or ""),
+            reason=str(sug.get("reason") or ""),
+            docs_excerpt=(
+                "Docs sections: " + ", ".join(sug.get("docs_sections") or [])
+                if sug.get("docs_sections") else None
+            ),
+        ))
+
+    summary = {
+        "unchanged":    sum(1 for it in items if it.kind == "unchanged"),
+        "needs_update": sum(1 for it in items if it.kind == "needs_update"),
+        "orphans":      sum(1 for it in items if it.kind == "orphan"),
+        "new_topics":   sum(1 for it in items if it.kind == "new_topic"),
+        "errors":       sum(1 for it in items if it.kind == "error"),
+    }
+
+    return Proposal(
+        decision="ready_for_review",
+        summary=summary,
+        docs_hash=docs_hash,
+        items=items,
+        generated_at=started_at,
+        tokens_in=total_in,
+        tokens_out=total_out,
+        notes=notes,
+    )
+
+
+# ─── New-topic body generation (called from the review UI) ───────────────────
+#
+# The propose() pipeline returns new-topic suggestions with no body — only
+# title + rationale + suggested category. If an admin decides one of those
+# suggestions is worth creating as a real article, they click "Generate
+# body" on its card, which calls this function. It's a single LLM call
+# with full semantic doc context, structured identically to Pass 1's
+# "write the new article" path so the output matches house voice exactly.
+
+def _generate_body_system_prompt() -> str:
+    return f"""You are writing a brand-new Bankr help center article from scratch.
+
+You will receive:
+  - The proposed article title (a real user question).
+  - The suggested category.
+  - Relevant docs chunks retrieved from docs.bankr.bot.
+
+Write a complete article body that answers the question, grounded entirely
+in the docs provided. If something isn't covered by the docs, omit it —
+don't invent.
+
+{_HOUSE_VOICE}
+
+Return ONLY a JSON object (no preamble, no markdown fence) shaped exactly:
+{{
+  "title": "(echo the title back, possibly polished — but keep it as a real
+            user question, not a heading)",
+  "description": "(one-sentence summary, ≤140 chars, for SEO + previews)",
+  "contentHtml": "(the body, in semantic HTML per the rules above)"
+}}"""
+
+
+async def generate_new_topic_body(
+    *,
+    docs_manager: SemanticDocsManager,
+    title: str,
+    category: str,
+    router: Optional[LLMRouter] = None,
+    docs_top_k: int = 8,
+) -> dict:
+    """
+    Generate a complete article body for one new-topic suggestion.
+
+    Returns:
+      {
+        "ok": bool,
+        "title": str,           # the LLM's polished title, or echo
+        "description": str,
+        "content_html": str,    # sanitized (no leading h1)
+        "tokens_in": int,
+        "tokens_out": int,
+        "error": str | None,
+      }
+
+    Never raises — failures are surfaced via ok=False + error.
+    """
+    router = router or LLMRouter()
+    query = f"{title} ({category})" if category else title
+    try:
+        chunks = await docs_manager.query_chunks(query, top_k=docs_top_k)
+    except Exception as e:
+        return {"ok": False, "title": title, "description": "", "content_html": "",
+                "tokens_in": 0, "tokens_out": 0,
+                "error": f"docs query failed: {e}"}
+
+    payload = {
+        "title":    title,
+        "category": category,
+        "relevant_docs_chunks": [
+            {"chunk_index": c.get("index"), "text": c["text"]} for c in chunks
+        ],
+    }
+    try:
+        resp = await router.chat(
+            messages=[{"role": "user", "content": json.dumps(payload, ensure_ascii=False)}],
+            system=_generate_body_system_prompt(),
+            temperature=0.2,
+        )
+    except Exception as e:
+        return {"ok": False, "title": title, "description": "", "content_html": "",
+                "tokens_in": 0, "tokens_out": 0,
+                "error": f"LLM call failed: {e}"}
+
+    tin  = getattr(resp, "tokens_in", 0) or 0
+    tout = getattr(resp, "tokens_out", 0) or 0
+    if not getattr(resp, "ok", True):
+        return {"ok": False, "title": title, "description": "", "content_html": "",
+                "tokens_in": tin, "tokens_out": tout,
+                "error": "LLM returned not-ok"}
+
+    parsed = _extract_json_object(str(resp))
+    if not parsed or "contentHtml" not in parsed:
+        log.error(f"generate_new_topic_body: unparseable LLM output: {str(resp)[:200]!r}")
+        return {"ok": False, "title": title, "description": "", "content_html": "",
+                "tokens_in": tin, "tokens_out": tout,
+                "error": "LLM returned unparseable output"}
+
+    polished_title = (parsed.get("title") or title).strip()
+    description    = (parsed.get("description") or "").strip()
+    content_html   = _sanitize_proposed_html(parsed.get("contentHtml") or "")
+
+    return {
+        "ok": True,
+        "title": polished_title,
+        "description": description,
+        "content_html": content_html,
+        "tokens_in": tin,
+        "tokens_out": tout,
+        "error": None,
+    }
+
+
+# ─── Publish: push selected items to Plain ───────────────────────────────────
+#
+# Called from the review page when the admin clicks "Publish N articles."
+# Each item is one upsert. We continue on per-item error, and the caller
+# (admin_routes) is responsible for saving the structured result via
+# redis_pubsub.save_publish_result so the results page can render it.
+#
+# PublishItem is the shape the caller assembles after composing edits onto
+# the proposal — we don't do that composition here, because the same
+# function will be used in tests with handcrafted inputs.
+
+@dataclass
+class PublishItem:
+    """One row to push to Plain. Caller composes edits onto proposal first."""
+    slug:          str
+    title:         str
+    content_html:  str
+    is_new:        bool                  # True → create, False → update existing
+    plain_id:      Optional[str] = None  # required when is_new=False
+    description:   Optional[str] = None
+    group_id:      Optional[str] = None
+
+
+async def publish_items(
+    *,
+    plain_client: PlainClient,
+    items: list[PublishItem],
+) -> list[dict]:
+    """
+    Upsert each PublishItem into Plain.
+
+    Returns a list of per-item result dicts:
+      {"slug":..., "ok": bool, "plain_id_after":..., "error": str|None,
+       "is_new": bool}
+
+    Continues on per-item errors — one failure doesn't abort the rest.
+    """
+    out: list[dict] = []
+    for it in items:
+        # Validate locally before hitting Plain. Catching obvious errors
+        # here makes the failure modes cleaner on the results page.
+        if not it.is_new and not it.plain_id:
+            out.append({"slug": it.slug, "ok": False,
+                        "plain_id_after": None, "is_new": False,
+                        "error": "Update requested but no plain_id provided."})
+            continue
+        if not it.title or not it.content_html:
+            out.append({"slug": it.slug, "ok": False,
+                        "plain_id_after": it.plain_id, "is_new": it.is_new,
+                        "error": "Empty title or content_html — refusing to publish."})
+            continue
+
+        try:
+            result = await plain_client.upsert_help_center_article(
+                help_center_id   = plain_articles.HELP_CENTER_ID,
+                title            = it.title,
+                content_html     = it.content_html,
+                article_id       = it.plain_id if not it.is_new else None,
+                article_group_id = it.group_id,
+                description      = it.description,
+                slug             = it.slug if it.is_new else None,
+                # Status defaults: new articles go in as drafts so a human
+                # can review the live preview before publishing. Updates
+                # keep their existing status.
+                status           = "DRAFT" if it.is_new else None,
+            )
+            if result and result.get("article"):
+                out.append({
+                    "slug": it.slug, "ok": True, "is_new": it.is_new,
+                    "plain_id_after": result["article"].get("id") or it.plain_id,
+                    "error": None,
+                })
+            else:
+                # PlainClient returns None on error and logs the GraphQL
+                # response. Pass that signal up.
+                out.append({
+                    "slug": it.slug, "ok": False, "is_new": it.is_new,
+                    "plain_id_after": it.plain_id,
+                    "error": "Plain upsert returned no article — see api logs.",
+                })
+        except Exception as e:
+            log.exception(f"publish_items failed for {it.slug}")
+            out.append({
+                "slug": it.slug, "ok": False, "is_new": it.is_new,
+                "plain_id_after": it.plain_id,
+                "error": f"Exception: {type(e).__name__}: {e}",
+            })
+
+    return out
