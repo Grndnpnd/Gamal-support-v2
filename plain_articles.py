@@ -19,9 +19,10 @@ Each article entry carries:
                            which slice(s) of the docs feed this article. Match
                            is case-insensitive substring against header text.
 
-The IDs in this file were captured live from Plain via the read-side test
-(test_plain_articles_read.py) on 2026-06-01. If Plain article IDs ever change
-(unlikely — they're immutable once created), re-run that test and update here.
+The IDs and slugs in this file were captured live from Plain on 2026-06-01.
+They are the ground-truth state of the help center at help.bankr.bot. If
+articles are added/removed/renamed in Plain, this file needs a code change
+to match — re-run the dump script and update the ARTICLES list below.
 
 Adding / removing articles is rare and requires a code change here +
 a deploy. That tradeoff is acceptable: 22 articles maintained by a small
@@ -82,69 +83,74 @@ def _entry(slug, title, plain_id, group_key, docs_sections):
 
 
 # ── The 22 articles ──────────────────────────────────────────────────────────
-# Plain IDs (hca_...) confirmed live. 16 articles have their real Plain IDs
-# baked in below. 6 articles still carry "hca_NEEDS_LOOKUP" because they
-# don't yet exist in Plain (the bootstrap couldn't resolve them on the first
-# real propose run): openclaw, bankr-skills, account-security, scams-and-
-# safety, login-issues, transaction-issues. The propose pipeline correctly
-# flags these as needing creation rather than update; the publish step
-# (stage 3) calls upsertHelpCenterArticle with no helpCenterArticleId so
-# Plain creates them fresh, and a follow-up commit can backfill the real
-# IDs here from the first successful publish.
+# Source of truth: live Plain help-center fetch via
+#   PlainClient.get_help_center_articles(HELP_CENTER_ID).
+# This map was reconciled against Plain on 2026-06-01 — every article below
+# corresponds to a real article that currently exists in Plain. No placeholders.
+#
+# Titles match Plain exactly (not the user-question-style rewrites we used
+# earlier). Rationale: title changes affect URL/SEO/customer mental models and
+# should be deliberate per-article decisions made in Plain's UI, not side
+# effects of a body-sync run. The propose pipeline judges body content only.
+#
+# If articles are added/removed in Plain, re-run the dump script and update
+# this list:
+#     railway run python dump.py
+# (Or the diagnostic at scripts/test_plain_articles_read.py — same data.)
 
 ARTICLES = [
     # ── Getting Started (4) ──────────────────────────────────────────────────
     _entry("what-is-bankr",
-           "What Is Bankr?",
+           "What is Bankr?",
            "hca_01KRY66XFGQK2VXDDYG2BZZ2X5",
            "getting_started",
            ["introduction", "what is bankr", "overview"]),
     _entry("quick-start",
-           "How Do I Get Started with Bankr?",
+           "Quick Start Guide",
            "hca_01KRY67H3KQ2J3RE8ZAP7B6SWT",
            "getting_started",
            ["quick start", "getting started", "first steps"]),
     _entry("supported-chains",
-           "What Blockchains Does Bankr Support?",
+           "Supported Blockchains",
            "hca_01KRY688A4ZT6KT38DX9RCJXW3",
            "getting_started",
            ["supported chains", "blockchains", "networks", "chains"]),
     _entry("memory-and-storage",
-           "How Does Bankr Remember My Preferences?",
+           "Memory & File Storage",
            "hca_01KRY6DARP2VFQSB245F7EPEHR",
            "getting_started",
-           ["memory", "preferences", "storage", "remembers"]),
+           ["memory", "preferences", "storage", "file storage", "remembers"]),
 
     # ── Trading & Orders (5) ─────────────────────────────────────────────────
     _entry("how-to-trade",
-           "How Do I Place a Trade?",
+           "How to Trade (Swaps)",
            "hca_01KRY68Q51SDZ01WJWD2M0Y9P9",
            "trading_orders",
            ["trading", "swaps", "place a trade", "how to trade"]),
     _entry("limit-and-stop-orders",
-           "How Do Limit and Stop Orders Work?",
+           "Limit Orders & Stop Orders",
            "hca_01KRY694K4BJ8PDXWSTK01WP4G",
            "trading_orders",
            ["limit orders", "stop orders", "stop loss", "take profit"]),
     _entry("dca-and-twap",
-           "What Are DCA and TWAP Orders?",
+           "DCA & TWAP Orders",
            "hca_01KRY69HFBJ5M1WRDN4WJF16Z7",
            "trading_orders",
            ["dca", "dollar cost averaging", "twap", "time-weighted"]),
     _entry("leveraged-trading",
-           "How Does Leveraged Trading Work?",
+           "Leveraged Trading",
            "hca_01KRY69ZFKJQMHFF1HMF583WK5",
            "trading_orders",
            ["leverage", "leveraged trading", "perps", "perpetuals", "hyperliquid"]),
     _entry("polymarket",
-           "How Do I Use Polymarket with Bankr?",
+           "Prediction Markets (Polymarket)",
            "hca_01KRY6AA21BDWF5H7GFV3G9W3J",
            "trading_orders",
            ["polymarket", "prediction markets"]),
 
     # ── Wallet & Portfolio (3) ───────────────────────────────────────────────
     _entry("wallet-and-balances",
-           "How Do I Check My Wallet and Balances?",
+           "Your Wallet & Balances",
            "hca_01KRY6AVJDGSR4SBE40HKGM3FR",
            "wallet_portfolio",
            ["wallet", "balances", "portfolio overview"]),
@@ -161,65 +167,65 @@ ARTICLES = [
 
     # ── Token Launching (1) ──────────────────────────────────────────────────
     _entry("launching-a-token",
-           "How Do I Launch a Token?",
+           "Launching a Token",
            "hca_01KRY6BDHX8H4J3Z71AWPFHV09",
            "token_launching",
            ["token launch", "launching a token", "deploy token", "create token"]),
 
     # ── Automations (1) ──────────────────────────────────────────────────────
     _entry("automations",
-           "How Do Automations Work?",
+           "Setting Up Automations",
            "hca_01KRY6BY4SBJ6V66Y4A0M1ZT8H",
            "automations",
            ["automations", "automation", "scheduled", "recurring"]),
 
     # ── Bankr Club & Billing (2) ─────────────────────────────────────────────
     _entry("bankr-club-and-max-mode",
-           "What Is Bankr Club and Max Mode?",
+           "Bankr Club & Max Mode",
            "hca_01KRY6CQQV45YESM63ZWH65APM",
            "bankr_club",
            ["bankr club", "max mode", "club membership", "premium"]),
     _entry("llm-gateway",
-           "What Is the LLM Gateway?",
+           "LLM Gateway & Credits",
            "hca_01KRY6GVRAW4DHHBSM0N1YHKQN",
            "bankr_club",
-           ["llm gateway", "llm", "ai gateway", "api"]),
+           ["llm gateway", "llm", "ai gateway", "credits", "api"]),
 
-    # ── Apps & Extensions (2) ────────────────────────────────────────────────
-    _entry("openclaw",
-           "What Is OpenClaw?",
-           "hca_NEEDS_LOOKUP",
+    # ── Apps & Extensions (4) ────────────────────────────────────────────────
+    _entry("building-apps",
+           "Building Apps",
+           "hca_01KRY6DWJ30WD7HDRME35F1KPS",
            "apps_extensions",
-           ["openclaw", "open claw"]),
-    _entry("bankr-skills",
-           "How Do I Use Bankr Skills?",
-           "hca_NEEDS_LOOKUP",
+           ["building apps", "apps feature", "build app"]),
+    _entry("skills-and-extensions",
+           "Skills, MCP Servers & Env Vars",
+           "hca_01KRY6EEJB90C8PA03MYPQAW27",
            "apps_extensions",
-           ["bankr skill", "skills", "skill package"]),
+           ["bankr skill", "skills", "skill package", "mcp", "mcp server", "env vars", "environment variables"]),
+    _entry("browser-automation",
+           "Browser Automation",
+           "hca_01KRY6EZJTWXTGFMSYRV0606YF",
+           "apps_extensions",
+           ["browser automation", "browser", "web automation"]),
+    _entry("claude-plugins",
+           "Using Bankr from Claude Code",
+           "hca_01KRY6HDAEVEYJHS2E461VMPBS",
+           "apps_extensions",
+           ["claude code", "claude plugins", "using bankr from claude", "vscode"]),
 
-    # ── Security (2) ─────────────────────────────────────────────────────────
-    _entry("account-security",
-           "How Do I Keep My Bankr Account Secure?",
-           "hca_NEEDS_LOOKUP",
+    # ── Security (1) ─────────────────────────────────────────────────────────
+    _entry("security",
+           "Protecting Your Account",
+           "hca_01KRY6FJQREDNTAB8HDZDBAYRA",
            "security",
-           ["security", "account security", "2fa", "two factor"]),
-    _entry("scams-and-safety",
-           "How Do I Avoid Scams and Stay Safe?",
-           "hca_NEEDS_LOOKUP",
-           "security",
-           ["scams", "safety", "phishing", "fraud"]),
+           ["security", "account security", "protecting", "2fa", "two factor", "scams", "safety", "phishing"]),
 
-    # ── Troubleshooting (2) ──────────────────────────────────────────────────
-    _entry("login-issues",
-           "Why Can't I Sign In to Bankr?",
-           "hca_NEEDS_LOOKUP",
+    # ── Troubleshooting (1) ──────────────────────────────────────────────────
+    _entry("troubleshooting",
+           "Common Issues & Fixes",
+           "hca_01KRY6G9PM5JQV91MFVJR2SEE3",
            "troubleshooting",
-           ["login", "sign in", "401", "can't access", "locked out"]),
-    _entry("transaction-issues",
-           "Why Did My Transaction Fail?",
-           "hca_NEEDS_LOOKUP",
-           "troubleshooting",
-           ["transaction failed", "tx failed", "swap failed", "errors"]),
+           ["troubleshooting", "common issues", "fixes", "login", "sign in", "transaction failed", "errors"]),
 ]
 
 
