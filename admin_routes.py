@@ -29,7 +29,7 @@ from datetime import datetime, timezone, timedelta
 from typing import Optional
 
 from fastapi import APIRouter, Cookie, Depends, Form, HTTPException, Request
-from fastapi.responses import HTMLResponse, RedirectResponse, Response
+from fastapi.responses import HTMLResponse, RedirectResponse, Response, JSONResponse
 from itsdangerous import BadSignature, SignatureExpired, URLSafeTimedSerializer
 
 from redis_overrides import (
@@ -850,22 +850,73 @@ async def dashboard(_: None = Depends(require_admin)):
       </div>
     </div>
 
-    <div class="panel accent-yellow">
-      <h3>Help center sync &nbsp; {sync_pill}</h3>
+    <div class="panel accent-yellow" id="article-sync-panel"
+         data-sync-state="{_esc(sync_state)}">
+      <h3>Help center sync &nbsp; <span id="article-sync-pill">{sync_pill}</span></h3>
       <p class="dim">
         Generate a proposal of what should change in the customer-facing
         help center at help.bankr.bot — based on the latest documentation.
         The proposal is reviewed and edited before anything is published;
         nothing goes live until you click Publish on the review page.
       </p>
-      <p class="hint" style="margin: 0 0 14px;">{sync_line}</p>
-      <div style="display:flex; flex-wrap:wrap; gap:8px; align-items:center;">
+      <p class="hint" style="margin: 0 0 14px;" id="article-sync-line">{sync_line}</p>
+      <div style="display:flex; flex-wrap:wrap; gap:8px; align-items:center;" id="article-sync-actions">
         {review_link_html}
         <form method="POST" action="/admin/article-sync" style="display:inline;" {sync_btn_confirm}>
           <button class="secondary" type="submit">{sync_btn_label}</button>
         </form>
       </div>
     </div>
+
+    <script>
+      // Live-update the article-sync panel while a run is in flight.
+      // Polls /admin/article-sync/status every 4s. When state transitions
+      // out of 'running', does a full page reload so the panel re-renders
+      // with the right button label, the Review link, etc.
+      (function () {{
+        const panel = document.getElementById('article-sync-panel');
+        if (!panel) return;
+        let initialState = panel.dataset.syncState;
+        let polling = (initialState === 'running');
+
+        const lineEl = document.getElementById('article-sync-line');
+        const pillEl = document.getElementById('article-sync-pill');
+
+        async function tick() {{
+          if (!polling) return;
+          try {{
+            const r = await fetch('/admin/article-sync/status', {{ credentials: 'same-origin' }});
+            if (!r.ok) return;
+            const s = await r.json();
+            if (!s || !s.state) return;
+            // Update inline text & pill so the user sees progress
+            if (lineEl && s.detail) {{
+              const at = (s.at || '').slice(11, 19);
+              lineEl.textContent = `${{s.detail}} · ${{at}} UTC`;
+            }}
+            if (pillEl) {{
+              if (s.state === 'running') {{
+                pillEl.innerHTML = '<span class="pill warn-pill">in progress</span>';
+              }} else if (s.state === 'ready') {{
+                pillEl.innerHTML = '<span class="pill ok-pill">ready</span>';
+              }} else if (s.state === 'failed') {{
+                pillEl.innerHTML = '<span class="pill danger-pill">failed</span>';
+              }}
+            }}
+            // State transition out of running → full reload so the button
+            // label, Review link, and any conditional UI all reflect new state.
+            if (s.state !== 'running' && initialState === 'running') {{
+              polling = false;
+              setTimeout(() => window.location.reload(), 500);
+            }}
+          }} catch (e) {{
+            // Network blip — keep polling.
+          }}
+        }}
+
+        if (polling) setInterval(tick, 4000);
+      }})();
+    </script>
 
     <h2 style="margin-top:36px;">Doc Overrides</h2>
     <p class="dim">
@@ -973,6 +1024,30 @@ async def trigger_article_sync(request: Request, _: None = Depends(require_admin
     _check_csrf(request)
     await request_article_sync(triggered_by="admin panel")
     return RedirectResponse("/admin", status_code=303)
+
+
+@router.get("/article-sync/status")
+async def article_sync_status_json(_: None = Depends(require_admin)):
+    """
+    JSON status endpoint for the Controls page's live poller.
+
+    Returns the current article-sync status (state + detail + timestamp +
+    proposal_id) without re-rendering the whole admin page. Polled every
+    4 seconds by JS on the Controls page while a run is in flight, so the
+    user sees "Pass 1: judging articles (7/22)" tick up live instead of a
+    frozen "in progress" label.
+
+    The cookie auth on this endpoint is the same Depends(require_admin)
+    that gates every other admin route — the poller passes the cookie via
+    credentials: 'same-origin'.
+    """
+    status = await get_article_sync_status() or {}
+    return JSONResponse({
+        "state":       status.get("state", "idle"),
+        "detail":      status.get("detail", ""),
+        "at":          status.get("at", ""),
+        "proposal_id": status.get("proposal_id"),
+    })
 
 
 # ─── Override CRUD ────────────────────────────────────────────────────────────
@@ -2239,35 +2314,67 @@ _ARTICLE_SYNC_STYLE = """
   .async-card { margin-bottom:16px; }
   .async-card-head { display:flex; justify-content:space-between; align-items:flex-start; gap:12px; }
   .async-rationale {
-    margin-top:10px; padding:10px 12px; border-left:3px solid #805dee;
-    background:#f6f3ff; border-radius:4px; font-size:14px;
+    margin-top:10px; padding:10px 12px;
+    border-left:3px solid var(--accent);
+    background: rgba(128,93,238,0.10);
+    border-radius:4px; font-size:14px;
+    color: var(--text);
   }
-  .async-newtopic .async-rationale { border-left-color:#ff673c; background:#fff5ef; }
+  .async-newtopic .async-rationale {
+    border-left-color: var(--warn);
+    background: rgba(255,103,60,0.10);
+  }
+  .async-rationale strong { color: var(--accent-2); }
   .async-current pre {
-    background:#fafafa; padding:10px; border-radius:4px; max-height:200px;
+    background: var(--panel-2);
+    color: var(--text);
+    padding:10px; border-radius:4px; max-height:200px;
     overflow:auto; font-size:12px; white-space:pre-wrap; word-break:break-word;
+    border:1px solid var(--border);
   }
   .async-edit-form { margin-top:12px; }
   .async-body {
     width:100%; font-family:ui-monospace, Consolas, monospace; font-size:12px;
-    border:1px solid #ddd; border-radius:4px; padding:8px;
+    border:1px solid var(--border); border-radius:4px; padding:8px;
+    background: var(--bg-2);
+    color: var(--text);
+    resize: vertical;
   }
+  .async-body:focus { outline:none; border-color: var(--accent); }
+  .async-edit-form input[type="text"] {
+    width:100%; padding:8px; border-radius:4px;
+    border:1px solid var(--border);
+    background: var(--bg-2); color: var(--text);
+    font-size:13px; margin-top:4px;
+  }
+  .async-edit-form input[type="text"]:focus { outline:none; border-color: var(--accent); }
   .async-card-actions { margin-top:10px; display:flex; gap:8px; align-items:center; flex-wrap:wrap; }
-  .badge { display:inline-block; padding:2px 8px; border-radius:10px; font-size:11px; font-weight:600; }
-  .badge-warn { background:#fff3cd; color:#7a5b00; }
-  .badge-edit { background:#e9e3ff; color:#4a2fc4; }
+  .badge { display:inline-block; padding:3px 9px; border-radius:10px; font-size:11px; font-weight:600; white-space:nowrap; }
+  .badge-warn { background: rgba(255,103,60,0.18); color: var(--warn); border:1px solid rgba(255,103,60,0.35); }
+  .badge-edit { background: rgba(128,93,238,0.18); color: var(--accent-2); border:1px solid rgba(128,93,238,0.35); }
   .btn-sm { padding:4px 10px; font-size:13px; }
   .async-summary-strip {
     display:flex; gap:20px; flex-wrap:wrap;
-    padding:12px 16px; background:#f6f3ff; border-radius:6px;
+    padding:12px 16px;
+    background: var(--panel);
+    border:1px solid var(--border);
+    border-radius:6px;
     margin-bottom:16px; font-size:14px;
+    color: var(--text);
   }
-  .async-summary-strip strong { color:#805dee; }
+  .async-summary-strip strong { color: var(--accent-2); }
+  .async-summary-strip .dim { color: var(--text-faint); }
   #bulk-publish-bar {
-    position:sticky; bottom:0; background:#ffffffee; backdrop-filter:blur(6px);
-    border-top:2px solid #805dee; padding:12px 16px; margin-top:24px;
+    position:sticky; bottom:0;
+    background: rgba(19,17,29,0.92);
+    backdrop-filter: blur(8px);
+    border-top:2px solid var(--accent);
+    padding:14px 18px; margin-top:24px;
     display:flex; justify-content:space-between; align-items:center; gap:12px;
+    color: var(--text);
   }
+  details summary { color: var(--text-dim); }
+  details summary:hover { color: var(--text); }
 </style>
 <script>
   // Live count of selected articles in the publish bar.
@@ -2617,7 +2724,24 @@ async def article_sync_publish(request: Request, _: None = Depends(require_admin
             group_id     = item.get("group_id") or None,
         ))
 
-    plain_client = PlainClient()
+    plain_api_key = os.getenv("PLAIN_API_KEY", "")
+    if not plain_api_key:
+        log.error("article-sync publish: PLAIN_API_KEY not set in api service env")
+        # Save a failure record so the user sees what happened on the results page
+        run_id = "run_" + datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+        await save_publish_result(run_id, {
+            "run_id":      run_id,
+            "proposal_id": proposal_id,
+            "started_at":  datetime.now(timezone.utc).isoformat(),
+            "finished_at": datetime.now(timezone.utc).isoformat(),
+            "items": [{"slug": s, "ok": False, "is_new": False,
+                       "plain_id_after": None,
+                       "error": "PLAIN_API_KEY not set in api service env"}
+                      for s in selected],
+        })
+        return RedirectResponse(url=f"/admin/article-sync/results/{run_id}", status_code=303)
+
+    plain_client = PlainClient(plain_api_key)
     started_at = datetime.now(timezone.utc).isoformat()
     upsert_results = await publish_items(plain_client=plain_client, items=publish_set)
     finished_at = datetime.now(timezone.utc).isoformat()

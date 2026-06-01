@@ -483,6 +483,7 @@ async def propose(
     plain_client: PlainClient,
     router: Optional[LLMRouter] = None,
     docs_top_k: int = 8,
+    progress_cb=None,
 ) -> Proposal:
     """
     Run the two-pass propose pipeline end to end.
@@ -495,6 +496,11 @@ async def propose(
       plain_client  - authenticated PlainClient. We only read; no writes here.
       router        - LLMRouter. Defaults to a fresh LLMRouter().
       docs_top_k    - chunks to retrieve per article for Pass 1. Default 8.
+      progress_cb   - optional async callable `progress_cb(stage: str)` invoked
+                      at meaningful checkpoints. The admin panel uses this to
+                      surface live progress in the status panel during the
+                      ~1-3 min run. Failures in the callback are swallowed —
+                      progress reporting never breaks the pipeline.
 
     Returns: Proposal (see dataclass). Never raises — per-article failures
     are captured as kind='error' items.
@@ -504,6 +510,15 @@ async def propose(
     notes: list[str] = []
     total_in = 0
     total_out = 0
+
+    async def _emit(stage: str):
+        """Fire progress_cb safely. Never raises."""
+        if progress_cb is None:
+            return
+        try:
+            await progress_cb(stage)
+        except Exception as e:
+            log.warning(f"progress_cb failed (ignored): {e}")
 
     # ── Sanity check the docs ─────────────────────────────────────────────
     docs_text = docs_manager.raw_content
@@ -540,8 +555,13 @@ async def propose(
 
     # ── PASS 1: Freshness check, per article ─────────────────────────────
     log.info("Pass 1: judging freshness of each of 22 articles...")
+    total_articles = len(list(plain_articles.iter_articles()))
+    pass1_done = 0
+    pass1_lock = asyncio.Lock()
+    await _emit(f"Pass 1: judging articles (0/{total_articles})")
 
     async def _judge_with_chunks(entry):
+        nonlocal pass1_done
         # Build a search query that semantically retrieves docs relevant to
         # this article: title + category usually gets richer results than
         # title alone because category disambiguates ("how do I trade" vs
@@ -554,6 +574,11 @@ async def propose(
             plain_by_slug.get(entry["slug"]),
             chunks,
         )
+        async with pass1_lock:
+            pass1_done += 1
+            done_now = pass1_done
+        # Emit outside the lock to avoid serializing Redis I/O
+        await _emit(f"Pass 1: judging articles ({done_now}/{total_articles})")
         return entry, chunks, result
 
     # Bound concurrency so we don't fire 22 LLM calls in parallel and trip
@@ -608,6 +633,7 @@ async def propose(
 
     # ── PASS 2: Gap detection ────────────────────────────────────────────
     log.info("Pass 2: scanning docs for topics not covered by existing articles...")
+    await _emit("Pass 2: scanning docs for new-topic gaps")
     sections = extract_topical_sections(docs_text)
     notes.append(
         f"Filtered docs to {len(sections)} topical H1/H2 section(s) "

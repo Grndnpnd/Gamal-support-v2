@@ -115,10 +115,18 @@ async def lifespan(app: FastAPI):
             # Use the docs manager that's already loaded — same instance the
             # /query endpoint uses, so we don't re-fetch.
             plain = PlainClient(plain_api_key)
+
+            # Stream progress through the same status key the admin panel
+            # already polls — turns "in progress…" into a live counter like
+            # "Pass 1: judging articles (7/22)".
+            async def _progress(stage: str):
+                await set_article_sync_status("running", detail=stage)
+
             proposal = await article_sync.propose(
                 docs_manager=docs,
                 plain_client=plain,
                 router=ollama,
+                progress_cb=_progress,
             )
             ok = await save_article_sync_proposal(proposal_id, proposal.to_dict())
             if not ok:
