@@ -102,6 +102,43 @@ class Proposal:
         return asdict(self)
 
 
+def _html_to_text_excerpt(html: str, max_chars: int = 800) -> str:
+    """
+    Strip HTML tags and collapse whitespace to produce a plain-text preview
+    of an article body, suitable for feeding into an LLM prompt without
+    burning tokens on markup.
+
+    Used by Pass 2 (gap detection): we want the LLM to judge coverage based
+    on what each article actually says, not its tag soup. A plain-text 800-
+    char excerpt captures the topic + approach + key terms with minimal
+    prompt-cost overhead.
+
+    Not a full HTML sanitizer — just a quick token-conscious flattener.
+    Handles the small subset of tags we generate (p, h2, h3, ol/ul/li,
+    code, pre, a, strong, em). Drops everything else's tags but keeps text.
+    """
+    if not html:
+        return ""
+    # Drop script/style blocks entirely (defense-in-depth — we don't generate
+    # them, but if Plain ever returns one we don't want it in the LLM prompt).
+    text = re.sub(r"<(script|style)[^>]*>.*?</\1>", " ", html,
+                  flags=re.IGNORECASE | re.DOTALL)
+    # Add a space at block-level tag boundaries so words don't run together
+    text = re.sub(r"</(p|h\d|li|div|br|tr|td|th)>", " ", text, flags=re.IGNORECASE)
+    text = re.sub(r"<br\s*/?>", " ", text, flags=re.IGNORECASE)
+    # Strip remaining tags
+    text = re.sub(r"<[^>]+>", "", text)
+    # Decode the few HTML entities we commonly emit
+    text = (text.replace("&nbsp;", " ").replace("&amp;", "&")
+                .replace("&lt;", "<").replace("&gt;", ">")
+                .replace("&quot;", '"').replace("&#39;", "'"))
+    # Collapse whitespace
+    text = re.sub(r"\s+", " ", text).strip()
+    if len(text) > max_chars:
+        text = text[:max_chars].rstrip() + "…"
+    return text
+
+
 # ─── Header parser (Pass 2 input prep) ───────────────────────────────────────
 #
 # We deliberately only look at H1 and H2 because the docs are inconsistent
@@ -393,26 +430,30 @@ async def _judge_one_article(
 # ─── Pass 2: Gap detection (one call across the whole docs) ──────────────────
 
 def _pass2_system_prompt() -> str:
-    return f"""You are reviewing the structural top-level sections of the Bankr documentation against the current set of 22 help center article titles.
+    return f"""You are reviewing the structural top-level sections of the Bankr documentation against the current set of 22 help center articles, including the actual content each article covers.
 
-Your job: identify any documentation sections that describe a meaningful topic NOT covered by any existing help center article — these are candidates for new articles.
+Your job: identify documentation sections that describe a meaningful topic NOT covered by any existing help center article. These are candidates for new articles.
+
+CRITICAL: Existing articles cover MORE than their titles suggest. A topic is "covered" if it is meaningfully discussed in the body of an existing article, not only if it's named in the title. Examples of correct judgment:
+- Docs section "Hyperliquid Trading" + existing "Leveraged Trading" article whose body covers Hyperliquid as the leverage venue → COVERED, do not suggest.
+- Docs section "Setting up MCP servers" + existing "Skills, MCP Servers & Env Vars" article → COVERED, do not suggest.
+- Docs section "Token sniping" + no existing article mentions sniping → NOT COVERED, suggest.
 
 You will receive:
-- A list of documentation sections (header + short body preview).
-- A list of the 22 existing help center article titles and their categories.
+- existing_articles: each with title, slug, category, and a body excerpt showing
+  what the article actually covers. Read the excerpts before deciding.
+- docs_sections: each with header and a short body preview.
 
-For each docs section, decide whether the topic is already covered by an
-existing article. If multiple sections describe one new topic, fold them
-into one new-article suggestion.
-
-Be conservative. Most sections are likely covered already, since the 22
-articles span the main user-facing surface area of Bankr. Only suggest a
-new article when:
-- The docs describe a feature or topic that no existing article covers
+Be aggressive about identifying coverage. Default to "covered" unless the docs
+section describes a topic substantially absent from every existing article.
+Only suggest a new article when:
+- No existing article's body covers the topic (titles alone don't count)
 - The topic is distinct enough that a user would search for it separately
-  (not just one paragraph inside a broader topic)
+  (not just one paragraph inside a broader existing topic)
 - The topic is something a customer would care about (not internal,
   not developer-only API minutiae)
+
+If multiple docs sections describe one new topic, fold them into one suggestion.
 
 {_HOUSE_VOICE}
 
@@ -423,7 +464,7 @@ Respond ONLY with a single JSON object. No preamble, no markdown fence:
       "suggested_slug":   "kebab-case-slug",
       "suggested_title":  "How Do I ...?",
       "suggested_category": "Getting Started" | "Trading & Orders" | "Wallet & Portfolio" | "Token Launching" | "Automations" | "Bankr Club & Billing" | "Apps & Extensions" | "Security" | "Troubleshooting",
-      "reason":           "One-line rationale. Reference which docs section(s) prompted this.",
+      "reason":           "One-line rationale. Cite which existing articles you considered and why they don't cover this — proves you checked bodies, not just titles.",
       "docs_sections":    ["Section header 1", "Section header 2"]
     }}
   ]
@@ -440,10 +481,22 @@ async def _detect_gaps(
 ) -> tuple[list[dict], int, int]:
     """
     Run Pass 2. Returns (suggestions, tokens_in, tokens_out).
+
+    existing_articles items are expected to be enriched with a body_excerpt
+    field: a plain-text view (HTML stripped, truncated to ~800 chars) of
+    what each article actually covers. This is what lets the LLM judge
+    "Hyperliquid is covered by Leveraged Trading" — without the excerpt
+    the LLM only sees titles and over-suggests new articles for topics
+    that are already covered in bodies.
     """
     user_payload = {
         "existing_articles": [
-            {"title": a["title"], "slug": a["slug"], "category": a["group_name"]}
+            {
+                "title":         a["title"],
+                "slug":          a["slug"],
+                "category":      a["group_name"],
+                "body_excerpt":  a.get("body_excerpt", ""),
+            }
             for a in existing_articles
         ],
         "docs_sections": [
@@ -639,10 +692,33 @@ async def propose(
         f"Filtered docs to {len(sections)} topical H1/H2 section(s) "
         f"(from raw 1,000+ headers; dropped code-block + placeholder noise)."
     )
+
+    # Build the enriched existing-articles view that Pass 2 needs to judge
+    # coverage by *what each article actually contains*, not just by title.
+    # The body_excerpt is what the article will look like after this sync:
+    #   - For needs_update items: the freshly-proposed new body
+    #   - For unchanged items:    the current body Plain has today
+    # Either way, this is the "effective coverage" view — the state of the
+    # help center as it would exist if every Pass 1 proposal were published.
+    # That's the right baseline for "do we still need a new article?".
+    items_by_slug = {it.slug: it for it in items}
+    enriched_existing: list[dict] = []
+    for entry in plain_articles.iter_articles():
+        it = items_by_slug.get(entry["slug"])
+        body_html = ""
+        if it:
+            body_html = it.proposed_html or it.current_html or ""
+        enriched_existing.append({
+            "slug":         entry["slug"],
+            "title":        entry["title"],
+            "group_name":   entry["group_name"],
+            "body_excerpt": _html_to_text_excerpt(body_html, max_chars=800),
+        })
+
     suggestions, p2_in, p2_out = await _detect_gaps(
         router,
         docs_sections=sections,
-        existing_articles=list(plain_articles.iter_articles()),
+        existing_articles=enriched_existing,
     )
     total_in  += p2_in
     total_out += p2_out

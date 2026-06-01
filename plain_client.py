@@ -20,8 +20,15 @@ Two feature groups in one client:
 Required Plain API key permissions:
   customer:create, customer:edit, thread:create, thread:read,
   threadReply:create,
-  helpCenter:read, helpCenterArticleGroup:read,
+  helpCenter:read, helpCenter:edit,
+  helpCenterArticleGroup:read,
   helpCenterArticle:read, helpCenterArticle:create, helpCenterArticle:edit
+
+  Note on helpCenter:edit: Plain requires this broader scope on the help
+  center itself to call upsertHelpCenterArticle, even though the operation
+  targets a specific article. Discovered at runtime when a publish attempt
+  returned FORBIDDEN with the message
+  'Insufficient permissions, missing "helpCenter:edit"'.
 """
 
 import aiohttp
