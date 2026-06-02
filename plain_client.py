@@ -280,6 +280,97 @@ class PlainClient:
         log.info(f"Plain reply sent to thread {thread_id}")
         return True
 
+    async def send_chat(
+        self,
+        *,
+        customer_id: str,
+        text: str,
+        thread_id: Optional[str] = None,
+    ) -> Optional[dict]:
+        """
+        Send a chat-channel message to a customer in Plain.
+
+        Use this INSTEAD OF reply_to_thread when the customer has a fake/
+        placeholder email address (e.g. `discord_xxx@discord.invalid`).
+        reply_to_thread triggers an actual SMTP email send to the customer's
+        address — fake addresses bounce, Plain suppression-lists them, and
+        eventually every reply fails with cannot_reply_to_unsent_email. We
+        burned a Saturday afternoon on this; the fix is here.
+
+        sendChat appends a chat-style message to the customer's thread without
+        any SMTP send. Plain's own custom-channels docs prescribe this exact
+        pattern for fake-email customers.
+
+        Args:
+          customer_id: Plain customer ID (c_…). REQUIRED. Caller is expected
+                       to have stored this when the ticket was opened.
+          text:        Message body. Plain technically allows None when
+                       attachments are present, but we always send text and
+                       refuse empty strings — empty would get a less-helpful
+                       Plain validation error.
+          thread_id:   Optional. If omitted, Plain creates a fresh chat. We
+                       always pass it because we're replying into an existing
+                       ticket.
+
+        Returns the created `chat` dict on success ({id, text}) or None on
+        any failure. Errors are logged by _gql or below; caller only needs
+        to check truthiness.
+
+        See `Custom Channels` in Plain docs for full context:
+        https://help.plain.com/article/custom-channels
+        """
+        if not customer_id:
+            log.error("send_chat called with empty customer_id; refusing")
+            return None
+        if not text or not text.strip():
+            log.error("send_chat called with empty text; refusing")
+            return None
+
+        query = """
+        mutation sendChat($input: SendChatInput!) {
+          sendChat(input: $input) {
+            chat {
+              id
+              text
+            }
+            error {
+              message
+              type
+              code
+              fields { field message type }
+            }
+          }
+        }
+        """
+        variables = {
+            "input": {
+                "customerId": customer_id,
+                "text":       text,
+            }
+        }
+        if thread_id:
+            variables["input"]["threadId"] = thread_id
+
+        data = await self._gql(query, variables)
+        if not data:
+            return None
+
+        result = data.get("sendChat") or {}
+        if result.get("error"):
+            log.error(f"Plain sendChat error: {result['error']}")
+            return None
+
+        chat = result.get("chat")
+        if not chat:
+            log.error("Plain sendChat returned no chat and no error")
+            return None
+
+        log.info(
+            f"Plain chat sent: chat_id={chat.get('id')} "
+            f"thread={thread_id or '(new)'} customer={customer_id}"
+        )
+        return chat
+
     # ─── Get Thread Timeline (for polling-based reply delivery) ───────────────
 
     async def get_thread_messages(self, thread_id: str, after_cursor: Optional[str] = None) -> Optional[dict]:

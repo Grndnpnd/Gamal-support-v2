@@ -123,30 +123,46 @@ def is_using_redis() -> bool:
 
 
 # ─── Active Ticket Persistence ────────────────────────────────────────────────
-# Stores the two in-memory dicts from PlainTicketManager so they survive redeploys.
+# Stores the in-memory state from PlainTicketManager so it survives redeploys.
 #
-#   active_tickets:  discord_thread_id → plain_thread_id
-#   user_tickets:    discord_user_id   → discord_thread_id
+#   active_tickets:    discord_thread_id → plain_thread_id   (str→str hash)
+#   user_tickets:      discord_user_id   → discord_thread_id (str→str hash)
+#   ticket_customers:  discord_thread_id → plain_customer_id (str→str hash)
+#                      ─ added 2026-06-02 to support send_chat, which needs
+#                        the customer_id alongside the thread_id. See module
+#                        notes below on backward-compat.
 #
-# Both are stored as a single Redis hash under one key so they're always
-# written and read together atomically.
+# All three hashes are written and read together via pipelines so the state
+# stays internally consistent. Reads are tolerant of partial state — if a
+# ticket existed before ticket_customers was added, its customer_id lookup
+# returns None and the caller is expected to handle that (the bot's
+# forward_to_plain falls back to the old reply_to_thread path).
 
-ACTIVE_TICKETS_KEY = "active_tickets"
-USER_TICKETS_KEY   = "user_tickets"
+ACTIVE_TICKETS_KEY    = "active_tickets"
+USER_TICKETS_KEY      = "user_tickets"
+TICKET_CUSTOMERS_KEY  = "ticket_customers"
 
 # In-memory fallback dicts (local dev without Redis)
-_active_tickets_mem: dict[int, str] = {}
-_user_tickets_mem:   dict[int, int] = {}
+_active_tickets_mem:   dict[int, str] = {}
+_user_tickets_mem:     dict[int, int] = {}
+_ticket_customers_mem: dict[int, str] = {}
 
 
 async def save_active_ticket(
     discord_thread_id: int,
     plain_thread_id: str,
     user_id: int,
+    plain_customer_id: str | None = None,
 ) -> None:
     """
     Persist an active ticket to Redis.
     Called when a new ticket is opened.
+
+    plain_customer_id is optional for backward compatibility with old call
+    sites that may not pass it (none should after this change ships, but
+    the kwarg shape keeps the function safe to call either way). When
+    provided, it's stored in the ticket_customers hash so send_chat can
+    later look it up.
     """
     r = _get_redis()
     if r:
@@ -154,14 +170,26 @@ async def save_active_ticket(
             pipe = r.pipeline()
             await pipe.hset(ACTIVE_TICKETS_KEY, str(discord_thread_id), plain_thread_id)
             await pipe.hset(USER_TICKETS_KEY,   str(user_id), str(discord_thread_id))
+            if plain_customer_id:
+                await pipe.hset(
+                    TICKET_CUSTOMERS_KEY,
+                    str(discord_thread_id),
+                    plain_customer_id,
+                )
             await pipe.execute()
-            log.info(f"Redis: saved active ticket discord={discord_thread_id} plain={plain_thread_id}")
+            log.info(
+                f"Redis: saved active ticket discord={discord_thread_id} "
+                f"plain={plain_thread_id}"
+                + (f" customer={plain_customer_id}" if plain_customer_id else "")
+            )
             return
         except Exception as e:
             log.error(f"Redis save_active_ticket failed: {e} — falling back to memory")
 
     _active_tickets_mem[discord_thread_id] = plain_thread_id
     _user_tickets_mem[user_id] = discord_thread_id
+    if plain_customer_id:
+        _ticket_customers_mem[discord_thread_id] = plain_customer_id
 
 
 async def delete_active_ticket(discord_thread_id: int, user_id: int) -> None:
@@ -173,8 +201,9 @@ async def delete_active_ticket(discord_thread_id: int, user_id: int) -> None:
     if r:
         try:
             pipe = r.pipeline()
-            await pipe.hdel(ACTIVE_TICKETS_KEY, str(discord_thread_id))
-            await pipe.hdel(USER_TICKETS_KEY,   str(user_id))
+            await pipe.hdel(ACTIVE_TICKETS_KEY,   str(discord_thread_id))
+            await pipe.hdel(USER_TICKETS_KEY,     str(user_id))
+            await pipe.hdel(TICKET_CUSTOMERS_KEY, str(discord_thread_id))
             await pipe.execute()
             log.info(f"Redis: deleted active ticket discord={discord_thread_id}")
             return
@@ -183,28 +212,62 @@ async def delete_active_ticket(discord_thread_id: int, user_id: int) -> None:
 
     _active_tickets_mem.pop(discord_thread_id, None)
     _user_tickets_mem.pop(user_id, None)
+    _ticket_customers_mem.pop(discord_thread_id, None)
 
 
-async def load_active_tickets() -> tuple[dict[int, str], dict[int, int]]:
+async def load_active_tickets() -> tuple[dict[int, str], dict[int, int], dict[int, str]]:
     """
     Load all active tickets from Redis on bot startup.
-    Returns (active_tickets, user_tickets) as plain dicts.
+    Returns (active_tickets, user_tickets, ticket_customers) as plain dicts.
 
-    active_tickets: discord_thread_id (int) → plain_thread_id (str)
-    user_tickets:   discord_user_id (int)   → discord_thread_id (int)
+    active_tickets:   discord_thread_id (int) → plain_thread_id (str)
+    user_tickets:     discord_user_id (int)   → discord_thread_id (int)
+    ticket_customers: discord_thread_id (int) → plain_customer_id (str)
+
+    The ticket_customers dict may be EMPTY or a SUBSET of active_tickets —
+    that's expected: tickets opened before the customer_id storage was added
+    have no entry, and their forward path falls back to reply_to_thread.
     """
     r = _get_redis()
     if r:
         try:
-            raw_active = await r.hgetall(ACTIVE_TICKETS_KEY)
-            raw_users  = await r.hgetall(USER_TICKETS_KEY)
+            raw_active    = await r.hgetall(ACTIVE_TICKETS_KEY)
+            raw_users     = await r.hgetall(USER_TICKETS_KEY)
+            raw_customers = await r.hgetall(TICKET_CUSTOMERS_KEY)
 
-            active_tickets = {int(k): v for k, v in raw_active.items()}
-            user_tickets   = {int(k): int(v) for k, v in raw_users.items()}
+            active_tickets   = {int(k): v for k, v in raw_active.items()}
+            user_tickets     = {int(k): int(v) for k, v in raw_users.items()}
+            ticket_customers = {int(k): v for k, v in raw_customers.items()}
 
-            log.info(f"Redis: loaded {len(active_tickets)} active ticket(s) on startup")
-            return active_tickets, user_tickets
+            log.info(
+                f"Redis: loaded {len(active_tickets)} active ticket(s) on startup "
+                f"({len(ticket_customers)} with customer_id)"
+            )
+            return active_tickets, user_tickets, ticket_customers
         except Exception as e:
             log.error(f"Redis load_active_tickets failed: {e} — starting with empty state")
 
-    return dict(_active_tickets_mem), dict(_user_tickets_mem)
+    return (
+        dict(_active_tickets_mem),
+        dict(_user_tickets_mem),
+        dict(_ticket_customers_mem),
+    )
+
+
+async def get_customer_for_thread(discord_thread_id: int) -> str | None:
+    """
+    Look up the Plain customer ID associated with a Discord thread.
+
+    Returns None for tickets opened before customer_id storage was added —
+    callers must handle this case (the bot's forward_to_plain falls back to
+    reply_to_thread on None, which keeps pre-fix tickets working until they
+    close naturally).
+    """
+    r = _get_redis()
+    if r:
+        try:
+            value = await r.hget(TICKET_CUSTOMERS_KEY, str(discord_thread_id))
+            return value  # already str or None
+        except Exception as e:
+            log.error(f"Redis get_customer_for_thread failed: {e}")
+    return _ticket_customers_mem.get(discord_thread_id)

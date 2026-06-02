@@ -293,6 +293,19 @@ class PlainTicketManager:
         self._active_tickets: dict[int, str] = {}
         # discord_user_id → discord_thread_id (so we know if a user already has an open ticket)
         self._user_tickets: dict[int, int] = {}
+        # discord_thread_id → plain_customer_id. Captured at ticket creation
+        # so forward_to_plain can call plain.send_chat (chat-channel reply)
+        # instead of plain.reply_to_thread (email-channel reply that bounces
+        # against our fake `discord_xxx@discord.invalid` addresses and ends
+        # up suppression-listed). Per Plain's custom-channels docs:
+        #   "If you don't have a way of pairing a customer with their real
+        #    email address on creation … use sendChat for replies instead
+        #    of replyToThread."
+        # See plain_client.send_chat for the full rationale.
+        #
+        # Tickets opened before this dict existed have no entry — those keep
+        # working via the old reply_to_thread path until they close naturally.
+        self._thread_customers: dict[int, str] = {}
 
     def is_ticket_thread(self, channel_id: int) -> bool:
         return channel_id in self._active_tickets
@@ -365,8 +378,14 @@ class PlainTicketManager:
         # 4. Register the link in memory and persist to Redis
         self._active_tickets[discord_thread.id] = plain_thread_id
         self._user_tickets[user.id] = discord_thread.id
+        self._thread_customers[discord_thread.id] = plain_customer_id
         await register_thread_link(plain_thread_id, discord_thread.id)
-        await save_active_ticket(discord_thread.id, plain_thread_id, user.id)
+        await save_active_ticket(
+            discord_thread.id,
+            plain_thread_id,
+            user.id,
+            plain_customer_id=plain_customer_id,
+        )
 
         # 5. Add configured roles to the thread so they have visibility
         # MOD_ROLE_NAME supports comma-separated values e.g. "Moderator,Admin"
@@ -404,7 +423,20 @@ class PlainTicketManager:
         return discord_thread
 
     async def forward_to_plain(self, discord_thread_id: int, user: discord.User, text: str) -> bool:
-        """Forward a user message from a Discord ticket thread to Plain."""
+        """
+        Forward a user message from a Discord ticket thread to Plain.
+
+        Path selection:
+          - If we have the Plain customer_id for this ticket (every ticket
+            opened after the 2026-06-02 fix), call `send_chat`. That appends
+            a chat-style message with no SMTP send, sidestepping the bounce-
+            then-suppress problem that broke email-channel replies.
+          - Otherwise (pre-fix tickets restored from Redis without a stored
+            customer_id), fall back to the old `reply_to_thread` path so
+            in-flight tickets keep working until they close.
+
+        Returns True on a successful relay, False on failure.
+        """
         plain_thread_id = self._active_tickets.get(discord_thread_id)
         if not plain_thread_id:
             return False
@@ -413,6 +445,23 @@ class PlainTicketManager:
         # this message when Plain echoes it back, preventing an echo loop.
         # Also prefix with user name so agents know who typed it in Plain.
         formatted = f"[discord-relay] {user.display_name}: {text}"
+
+        customer_id = self._thread_customers.get(discord_thread_id)
+        if customer_id:
+            chat = await self.plain.send_chat(
+                customer_id=customer_id,
+                thread_id=plain_thread_id,
+                text=formatted,
+            )
+            return chat is not None
+
+        # Legacy path — pre-fix ticket with no stored customer_id. The email
+        # send may bounce (that's how we got here), but reply_to_thread is
+        # still the correct call for an email-channel thread.
+        log.warning(
+            f"forward_to_plain: no customer_id for ticket {discord_thread_id}; "
+            f"using legacy reply_to_thread path (ticket pre-dates send_chat fix)"
+        )
         return await self.plain.reply_to_thread(
             thread_id=plain_thread_id,
             text=formatted,
@@ -423,17 +472,28 @@ class PlainTicketManager:
         Restore active ticket state from Redis on startup.
         Called once from BankrSupportBot.on_ready so open tickets
         survive service redeploys.
+
+        load_active_tickets returns three dicts — the third (customers) may
+        be empty or a subset of active_tickets for tickets that pre-date
+        customer_id storage. Both shapes are fine; forward_to_plain falls
+        back to reply_to_thread when no customer_id is on file.
         """
-        active, users = await load_active_tickets()
+        active, users, customers = await load_active_tickets()
         self._active_tickets.update(active)
         self._user_tickets.update(users)
+        self._thread_customers.update(customers)
         if active:
-            log.info(f"Restored {len(active)} active ticket(s) from Redis")
+            log.info(
+                f"Restored {len(active)} active ticket(s) from Redis "
+                f"({len(customers)} with customer_id, "
+                f"{len(active) - len(customers)} on legacy reply path)"
+            )
 
     async def close_ticket(self, discord_thread_id: int, user_id: int) -> None:
         """Remove local and Redis tracking for a resolved ticket."""
         self._active_tickets.pop(discord_thread_id, None)
         self._user_tickets.pop(user_id, None)
+        self._thread_customers.pop(discord_thread_id, None)
         await delete_active_ticket(discord_thread_id, user_id)
 
 
