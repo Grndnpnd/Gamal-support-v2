@@ -812,7 +812,7 @@ async def dashboard(_: None = Depends(require_admin)):
       Operational toggles and response overrides for the Gamal support bot.
     </p>
 
-    <div class="grid cols-2">
+    <div class="grid cols-3">
       <div class="panel">
         <h3>Busy mode &nbsp; {busy_status_pill}</h3>
         <p class="dim">
@@ -848,23 +848,23 @@ async def dashboard(_: None = Depends(require_admin)):
           <button type="submit" {reindex_btn_attr}>{reindex_btn_label}</button>
         </form>
       </div>
-    </div>
 
-    <div class="panel accent-yellow" id="article-sync-panel"
-         data-sync-state="{_esc(sync_state)}">
-      <h3>Help center sync &nbsp; <span id="article-sync-pill">{sync_pill}</span></h3>
-      <p class="dim">
-        Generate a proposal of what should change in the customer-facing
-        help center at help.bankr.bot — based on the latest documentation.
-        The proposal is reviewed and edited before anything is published;
-        nothing goes live until you click Publish on the review page.
-      </p>
-      <p class="hint" style="margin: 0 0 14px;" id="article-sync-line">{sync_line}</p>
-      <div style="display:flex; flex-wrap:wrap; gap:8px; align-items:center;" id="article-sync-actions">
-        {review_link_html}
-        <form method="POST" action="/admin/article-sync" style="display:inline;" {sync_btn_confirm}>
-          <button class="secondary" type="submit">{sync_btn_label}</button>
-        </form>
+      <div class="panel accent-yellow" id="article-sync-panel"
+           data-sync-state="{_esc(sync_state)}">
+        <h3>Help center sync &nbsp; <span id="article-sync-pill">{sync_pill}</span></h3>
+        <p class="dim">
+          Generate a proposal of what should change in the customer-facing
+          help center at help.bankr.bot — based on the latest documentation.
+          The proposal is reviewed and edited before anything is published;
+          nothing goes live until you click Publish on the review page.
+        </p>
+        <p class="hint" style="margin: 0 0 14px;" id="article-sync-line">{sync_line}</p>
+        <div style="display:flex; flex-wrap:wrap; gap:8px; align-items:center;" id="article-sync-actions">
+          {review_link_html}
+          <form method="POST" action="/admin/article-sync" style="display:inline;" {sync_btn_confirm}>
+            <button class="secondary" type="submit">{sync_btn_label}</button>
+          </form>
+        </div>
       </div>
     </div>
 
@@ -2123,10 +2123,15 @@ def _render_pin_section(pins: dict) -> str:
 
 def _render_update_card(item: dict, edit: Optional[dict], pins: dict, proposal_id: str) -> str:
     """
-    Render one 'needs_update' or 'unchanged' card.
+    Render one 'needs_update' or 'unchanged' card, collapsed by default.
 
-    Includes: rationale, collapsed current body, editable proposed body,
-    editable description, publish checkbox, pin and save-edits actions.
+    Collapsed state shows: title, rationale, Pin/Publish actions.
+    Expanded state additionally reveals: current body (its own toggle),
+    proposed body editor, description, save-edits button.
+
+    The compact-by-default model assumes most cards just need a glance
+    ("yep, that's reasonable, publish it") and only some need editing.
+    Publishing a card without expanding is the cheap default path.
     """
     slug          = item.get("slug", "")
     eff           = _compose_item(item, edit)
@@ -2135,7 +2140,6 @@ def _render_update_card(item: dict, edit: Optional[dict], pins: dict, proposal_i
 
     rationale     = _esc(item.get("reason") or "")
     plain_id      = item.get("plain_id") or ""
-    group_name    = item.get("group_name") or ""
     current_html  = item.get("current_html") or ""
 
     pin_badge = ""
@@ -2145,84 +2149,83 @@ def _render_update_card(item: dict, edit: Optional[dict], pins: dict, proposal_i
             f'{_esc((pin_info or {}).get("pinned_by",""))} '
             f'{_esc(((pin_info or {}).get("pinned_at","") or "")[:19])}">📌 Pinned</span>'
         )
-
     edited_badge = ""
     if eff["edited"]:
         edited_at_short = _esc((eff["edited_at"] or "")[:19])
         edited_badge = f'<span class="badge badge-edit">✏️ Edited {edited_at_short}</span>'
 
     publish_disabled = "disabled" if is_pinned else ""
-    publish_label_dim = ' style="color:#9b9b9b;"' if is_pinned else ''
+    publish_label_dim = ' style="color:var(--text-faint);"' if is_pinned else ''
 
-    pin_btn_label = "Unpin" if is_pinned else "Pin (don't publish)"
+    pin_btn_label = "Unpin" if is_pinned else "Pin"
     pin_btn_action = "/admin/article-sync/unpin" if is_pinned else "/admin/article-sync/pin"
     pin_btn_class = "btn secondary" if is_pinned else "btn"
+
     return f"""
-    <article class="panel async-card" id="card-{_esc(slug)}">
-      <div class="async-card-head">
-        <div>
-          <h3 style="margin:0;">
-            {_esc(eff["effective_title"])}
-          </h3>
-          <div class="dim" style="font-size:13px; margin-top:4px;">
-            <code>{_esc(slug)}</code>
-            {f' · {_esc(group_name)}' if group_name else ''}
-            {f' · Plain ID: <code>{_esc(plain_id)}</code>' if plain_id else ''}
+    <details class="async-card-d" id="card-{_esc(slug)}">
+      <summary class="async-card-summary">
+        <div class="async-card-summary-main">
+          <span class="async-card-chevron">▸</span>
+          <div class="async-card-summary-text">
+            <div class="async-card-title">{_esc(eff["effective_title"])}</div>
+            {f'<div class="async-card-rationale">{rationale}</div>' if rationale else ''}
           </div>
         </div>
-        <div>
-          {pin_badge} {edited_badge}
+        <div class="async-card-summary-controls" onclick="event.stopPropagation();">
+          {pin_badge}{edited_badge}
+          <label{publish_label_dim} class="async-publish-lbl">
+            <input type="checkbox" name="publish_slugs" value="{_esc(slug)}"
+                   form="bulk-publish-form" {publish_disabled}>
+            Publish
+          </label>
+          <form method="POST" action="{pin_btn_action}" style="display:inline;">
+            <input type="hidden" name="slug" value="{_esc(slug)}">
+            <button type="submit" class="{pin_btn_class} btn-sm">{pin_btn_label}</button>
+          </form>
         </div>
-      </div>
+      </summary>
 
-      {f'<div class="async-rationale"><strong>LLM rationale:</strong> {rationale}</div>' if rationale else ''}
-
-      {f'''<details style="margin-top:12px;">
-        <summary style="cursor:pointer;" class="dim">▸ show current article body ({len(current_html)} chars)</summary>
-        <div class="async-current">
-          <pre>{_esc(current_html or '(empty)')}</pre>
+      <div class="async-card-body">
+        <div class="dim" style="font-size:12px; margin-bottom:8px;">
+          <code>{_esc(slug)}</code>
+          {f' · Plain ID: <code>{_esc(plain_id)}</code>' if plain_id else ''}
         </div>
-      </details>''' if current_html else '<p class="dim" style="margin-top:8px;">No current body in Plain — this would publish as a new article.</p>'}
 
-      <form method="POST" action="/admin/article-sync/edit" class="async-edit-form">
-        <input type="hidden" name="proposal_id" value="{_esc(proposal_id)}">
-        <input type="hidden" name="slug" value="{_esc(slug)}">
+        {f'''<details class="async-current-details">
+          <summary class="dim" style="cursor:pointer; font-size:13px;">▸ show current article body ({len(current_html)} chars)</summary>
+          <div class="async-current">
+            <pre>{_esc(current_html or '(empty)')}</pre>
+          </div>
+        </details>''' if current_html else '<p class="dim" style="font-size:13px;">No current body in Plain — would publish as new.</p>'}
 
-        <label class="dim" style="font-size:13px;">Proposed body (editable HTML):</label>
-        <textarea name="content_html" rows="14" class="async-body">{_esc(eff["effective_html"])}</textarea>
-
-        <label class="dim" style="font-size:13px; margin-top:8px;">Proposed description:</label>
-        <input type="text" name="description" value="{_esc(eff["effective_description"])}" maxlength="200">
-
-        <div class="async-card-actions">
-          <button type="submit" class="btn secondary btn-sm">Save my edits</button>
-        </div>
-      </form>
-
-      <div class="async-card-actions" style="margin-top:8px;">
-        <label{publish_label_dim}>
-          <input type="checkbox" name="publish_slugs" value="{_esc(slug)}"
-                 form="bulk-publish-form" {publish_disabled}>
-          <strong>Publish this update</strong>
-          {' <span class="dim">(unpin first)</span>' if is_pinned else ''}
-        </label>
-
-        <form method="POST" action="{pin_btn_action}" style="display:inline;">
+        <form method="POST" action="/admin/article-sync/edit" class="async-edit-form">
+          <input type="hidden" name="proposal_id" value="{_esc(proposal_id)}">
           <input type="hidden" name="slug" value="{_esc(slug)}">
-          <button type="submit" class="{pin_btn_class} btn-sm">{pin_btn_label}</button>
+
+          <label class="dim" style="font-size:13px;">Proposed body (editable HTML):</label>
+          <textarea name="content_html" rows="12" class="async-body">{_esc(eff["effective_html"])}</textarea>
+
+          <label class="dim" style="font-size:13px; margin-top:8px;">Proposed description:</label>
+          <input type="text" name="description" value="{_esc(eff["effective_description"])}" maxlength="200">
+
+          <div class="async-card-actions">
+            <button type="submit" class="btn secondary btn-sm">Save my edits</button>
+          </div>
         </form>
       </div>
-    </article>
+    </details>
     """
 
 
 def _render_new_topic_card(item: dict, edit: Optional[dict], proposal_id: str) -> str:
     """
-    Render one 'new_topic' suggestion card.
+    Render one 'new_topic' suggestion card, collapsed by default.
 
-    No body proposed by default — the admin has to click "Generate body"
-    to invoke a separate LLM call. After generation, the card mutates to
-    look like an update card with editable body + publish checkbox.
+    Two visual states based on whether the body has been generated:
+      A — no body yet. Header shows title + rationale + Generate body button.
+          (No publish checkbox; nothing to publish until a body exists.)
+      B — body generated. Header shows title + ✨ badge + Publish checkbox;
+          expanding reveals the editor and Regenerate button.
     """
     slug       = item.get("slug", "")
     eff        = _compose_item(item, edit)
@@ -2231,146 +2234,286 @@ def _render_new_topic_card(item: dict, edit: Optional[dict], proposal_id: str) -
     has_body   = bool(eff["effective_html"])
 
     if not has_body:
-        # State A: no body generated yet. Just title + rationale + Generate.
+        # State A — no body. Static card (no expand), just title + Generate.
         return f"""
-        <article class="panel async-card async-newtopic" id="card-{_esc(slug)}">
-          <div class="async-card-head">
-            <div>
-              <h3 style="margin:0;">
-                ✨ {_esc(eff["effective_title"])}
-              </h3>
-              <div class="dim" style="font-size:13px; margin-top:4px;">
-                Suggested category: {_esc(group_name) or '(none)'} · <code>{_esc(slug)}</code>
+        <article class="async-card-static async-newtopic" id="card-{_esc(slug)}">
+          <div class="async-card-summary">
+            <div class="async-card-summary-main">
+              <span class="async-card-spacer"></span>
+              <div class="async-card-summary-text">
+                <div class="async-card-title">✨ {_esc(eff["effective_title"])}</div>
+                {f'<div class="async-card-rationale">{rationale}</div>' if rationale else ''}
+                <div class="dim" style="font-size:12px; margin-top:4px;">
+                  Suggested category: {_esc(group_name) or '(none)'} · <code>{_esc(slug)}</code>
+                </div>
               </div>
             </div>
-          </div>
-
-          {f'<div class="async-rationale"><strong>LLM rationale:</strong> {rationale}</div>' if rationale else ''}
-
-          <div class="async-card-actions" style="margin-top:12px;">
-            <form method="POST" action="/admin/article-sync/generate-body" style="display:inline;">
-              <input type="hidden" name="proposal_id" value="{_esc(proposal_id)}">
-              <input type="hidden" name="slug" value="{_esc(slug)}">
-              <button type="submit" class="btn">Generate body</button>
-            </form>
-            <span class="dim" style="font-size:13px; margin-left:8px;">
-              (one LLM call, ~3-15s)
-            </span>
+            <div class="async-card-summary-controls">
+              <form method="POST" action="/admin/article-sync/generate-body" style="display:inline;">
+                <input type="hidden" name="proposal_id" value="{_esc(proposal_id)}">
+                <input type="hidden" name="slug" value="{_esc(slug)}">
+                <button type="submit" class="btn btn-sm">Generate body</button>
+              </form>
+            </div>
           </div>
         </article>
         """
 
-    # State B: body has been generated. Render full edit form + publish checkbox.
+    # State B — body generated. Collapsible card.
     return f"""
-    <article class="panel async-card async-newtopic" id="card-{_esc(slug)}">
-      <div class="async-card-head">
-        <div>
-          <h3 style="margin:0;">✨ {_esc(eff["effective_title"])}</h3>
-          <div class="dim" style="font-size:13px; margin-top:4px;">
-            Suggested category: {_esc(group_name) or '(none)'} · <code>{_esc(slug)}</code>
+    <details class="async-card-d async-newtopic" id="card-{_esc(slug)}">
+      <summary class="async-card-summary">
+        <div class="async-card-summary-main">
+          <span class="async-card-chevron">▸</span>
+          <div class="async-card-summary-text">
+            <div class="async-card-title">✨ {_esc(eff["effective_title"])}</div>
+            {f'<div class="async-card-rationale">{rationale}</div>' if rationale else ''}
+            <div class="dim" style="font-size:12px; margin-top:4px;">
+              Suggested category: {_esc(group_name) or '(none)'} · <code>{_esc(slug)}</code>
+            </div>
           </div>
         </div>
-        <div>
+        <div class="async-card-summary-controls" onclick="event.stopPropagation();">
           <span class="badge badge-edit">✨ Body generated</span>
+          <label class="async-publish-lbl">
+            <input type="checkbox" name="publish_slugs" value="{_esc(slug)}"
+                   form="bulk-publish-form">
+            Publish (DRAFT)
+          </label>
         </div>
+      </summary>
+
+      <div class="async-card-body">
+        <form method="POST" action="/admin/article-sync/edit" class="async-edit-form">
+          <input type="hidden" name="proposal_id" value="{_esc(proposal_id)}">
+          <input type="hidden" name="slug" value="{_esc(slug)}">
+
+          <label class="dim" style="font-size:13px;">Proposed body (editable HTML):</label>
+          <textarea name="content_html" rows="12" class="async-body">{_esc(eff["effective_html"])}</textarea>
+
+          <label class="dim" style="font-size:13px; margin-top:8px;">Proposed description:</label>
+          <input type="text" name="description" value="{_esc(eff["effective_description"])}" maxlength="200">
+
+          <div class="async-card-actions">
+            <button type="submit" class="btn secondary btn-sm">Save my edits</button>
+            <form method="POST" action="/admin/article-sync/generate-body" style="display:inline; margin-left:8px;"
+                  onsubmit="return confirm('Regenerate body? Your edits will be replaced.');">
+              <input type="hidden" name="proposal_id" value="{_esc(proposal_id)}">
+              <input type="hidden" name="slug" value="{_esc(slug)}">
+              <button type="submit" class="btn secondary btn-sm">Regenerate</button>
+            </form>
+          </div>
+        </form>
       </div>
-
-      {f'<div class="async-rationale"><strong>LLM rationale:</strong> {rationale}</div>' if rationale else ''}
-
-      <form method="POST" action="/admin/article-sync/edit" class="async-edit-form">
-        <input type="hidden" name="proposal_id" value="{_esc(proposal_id)}">
-        <input type="hidden" name="slug" value="{_esc(slug)}">
-
-        <label class="dim" style="font-size:13px;">Proposed body (editable HTML):</label>
-        <textarea name="content_html" rows="14" class="async-body">{_esc(eff["effective_html"])}</textarea>
-
-        <label class="dim" style="font-size:13px; margin-top:8px;">Proposed description:</label>
-        <input type="text" name="description" value="{_esc(eff["effective_description"])}" maxlength="200">
-
-        <div class="async-card-actions">
-          <button type="submit" class="btn secondary btn-sm">Save my edits</button>
-          <form method="POST" action="/admin/article-sync/generate-body" style="display:inline; margin-left:8px;"
-                onsubmit="return confirm('Regenerate body? Your edits will be replaced.');">
-            <input type="hidden" name="proposal_id" value="{_esc(proposal_id)}">
-            <input type="hidden" name="slug" value="{_esc(slug)}">
-            <button type="submit" class="btn secondary btn-sm">Regenerate</button>
-          </form>
-        </div>
-      </form>
-
-      <div class="async-card-actions" style="margin-top:8px;">
-        <label>
-          <input type="checkbox" name="publish_slugs" value="{_esc(slug)}"
-                 form="bulk-publish-form">
-          <strong>Publish as new article (DRAFT)</strong>
-        </label>
-      </div>
-    </article>
+    </details>
     """
 
 
 _ARTICLE_SYNC_STYLE = """
 <style>
-  .async-card { margin-bottom:16px; }
-  .async-card-head { display:flex; justify-content:space-between; align-items:flex-start; gap:12px; }
-  .async-rationale {
-    margin-top:10px; padding:10px 12px;
-    border-left:3px solid var(--accent);
-    background: rgba(128,93,238,0.10);
-    border-radius:4px; font-size:14px;
+  /* ── Category section headers ─────────────────────────────────────── */
+  .async-category {
+    margin-top: 20px;
+  }
+  .async-category > summary {
+    cursor: pointer;
+    list-style: none;
+    padding: 12px 16px;
+    background: var(--panel);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    font-weight: 600;
+    color: var(--text);
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    gap: 12px;
+    user-select: none;
+  }
+  .async-category > summary::-webkit-details-marker { display: none; }
+  .async-category > summary:hover { background: var(--panel-2); }
+  .async-category-chevron {
+    display: inline-block;
+    transition: transform 0.15s;
+    color: var(--text-dim);
+    font-size: 12px;
+    margin-right: 8px;
+  }
+  .async-category[open] > summary .async-category-chevron {
+    transform: rotate(90deg);
+  }
+  .async-category-counts {
+    font-size: 12px;
+    color: var(--text-dim);
+    font-weight: 400;
+  }
+  .async-category-body {
+    padding: 8px 0 0 0;
+  }
+
+  /* ── Collapsible article cards ────────────────────────────────────── */
+  .async-card-d,
+  .async-card-static {
+    margin: 8px 0;
+    background: var(--bg-2);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    overflow: hidden;
+  }
+  .async-card-d[open] {
+    border-color: var(--border-2);
+  }
+  .async-card-summary {
+    list-style: none;
+    cursor: pointer;
+    padding: 12px 14px;
+    display: flex;
+    justify-content: space-between;
+    align-items: flex-start;
+    gap: 14px;
+    color: var(--text);
+    user-select: none;
+  }
+  .async-card-static .async-card-summary { cursor: default; }
+  .async-card-summary::-webkit-details-marker { display: none; }
+  .async-card-d > .async-card-summary:hover { background: var(--panel); }
+  .async-card-summary-main {
+    display: flex;
+    gap: 10px;
+    align-items: flex-start;
+    flex: 1;
+    min-width: 0;
+  }
+  .async-card-chevron {
+    display: inline-block;
+    transition: transform 0.15s;
+    color: var(--text-dim);
+    font-size: 11px;
+    padding-top: 4px;
+    flex-shrink: 0;
+  }
+  .async-card-spacer {
+    display: inline-block;
+    width: 11px;
+    flex-shrink: 0;
+  }
+  .async-card-d[open] > .async-card-summary .async-card-chevron {
+    transform: rotate(90deg);
+  }
+  .async-card-summary-text { min-width: 0; flex: 1; }
+  .async-card-title {
+    font-weight: 600;
+    font-size: 14px;
+    margin-bottom: 4px;
     color: var(--text);
   }
-  .async-newtopic .async-rationale {
-    border-left-color: var(--warn);
-    background: rgba(255,103,60,0.10);
+  .async-card-rationale {
+    color: var(--text-dim);
+    font-size: 13px;
+    line-height: 1.5;
   }
-  .async-rationale strong { color: var(--accent-2); }
+  .async-card-summary-controls {
+    display: flex;
+    gap: 10px;
+    align-items: center;
+    flex-wrap: wrap;
+    flex-shrink: 0;
+  }
+  .async-publish-lbl {
+    font-size: 13px;
+    cursor: pointer;
+    color: var(--text);
+    display: inline-flex;
+    align-items: center;
+    gap: 4px;
+  }
+  .async-publish-lbl input { cursor: pointer; }
+
+  /* ── Expanded body ────────────────────────────────────────────────── */
+  .async-card-body {
+    padding: 0 14px 14px 14px;
+    border-top: 1px solid var(--border);
+  }
+  .async-current-details { margin: 10px 0; }
   .async-current pre {
     background: var(--panel-2);
     color: var(--text);
-    padding:10px; border-radius:4px; max-height:200px;
-    overflow:auto; font-size:12px; white-space:pre-wrap; word-break:break-word;
-    border:1px solid var(--border);
+    padding: 10px;
+    border-radius: 4px;
+    max-height: 200px;
+    overflow: auto;
+    font-size: 12px;
+    white-space: pre-wrap;
+    word-break: break-word;
+    border: 1px solid var(--border);
+    margin-top: 6px;
   }
-  .async-edit-form { margin-top:12px; }
+  .async-edit-form { margin-top: 12px; }
   .async-body {
-    width:100%; font-family:ui-monospace, Consolas, monospace; font-size:12px;
-    border:1px solid var(--border); border-radius:4px; padding:8px;
-    background: var(--bg-2);
+    width: 100%;
+    font-family: ui-monospace, Consolas, monospace;
+    font-size: 12px;
+    border: 1px solid var(--border);
+    border-radius: 4px;
+    padding: 8px;
+    background: var(--bg);
     color: var(--text);
     resize: vertical;
+    margin-top: 4px;
   }
-  .async-body:focus { outline:none; border-color: var(--accent); }
+  .async-body:focus { outline: none; border-color: var(--accent); }
   .async-edit-form input[type="text"] {
-    width:100%; padding:8px; border-radius:4px;
-    border:1px solid var(--border);
-    background: var(--bg-2); color: var(--text);
-    font-size:13px; margin-top:4px;
+    width: 100%;
+    padding: 8px;
+    border-radius: 4px;
+    border: 1px solid var(--border);
+    background: var(--bg);
+    color: var(--text);
+    font-size: 13px;
+    margin-top: 4px;
   }
-  .async-edit-form input[type="text"]:focus { outline:none; border-color: var(--accent); }
-  .async-card-actions { margin-top:10px; display:flex; gap:8px; align-items:center; flex-wrap:wrap; }
-  .badge { display:inline-block; padding:3px 9px; border-radius:10px; font-size:11px; font-weight:600; white-space:nowrap; }
+  .async-edit-form input[type="text"]:focus { outline: none; border-color: var(--accent); }
+  .async-card-actions {
+    margin-top: 10px;
+    display: flex;
+    gap: 8px;
+    align-items: center;
+    flex-wrap: wrap;
+  }
+
+  /* ── Badges ──────────────────────────────────────────────────────── */
+  .badge {
+    display: inline-block;
+    padding: 3px 9px;
+    border-radius: 10px;
+    font-size: 11px;
+    font-weight: 600;
+    white-space: nowrap;
+  }
   .badge-warn { background: rgba(255,103,60,0.18); color: var(--warn); border:1px solid rgba(255,103,60,0.35); }
   .badge-edit { background: rgba(128,93,238,0.18); color: var(--accent-2); border:1px solid rgba(128,93,238,0.35); }
-  .btn-sm { padding:4px 10px; font-size:13px; }
+  .btn-sm { padding: 4px 10px; font-size: 13px; }
+
+  /* ── Summary strip + sticky publish bar ──────────────────────────── */
   .async-summary-strip {
-    display:flex; gap:20px; flex-wrap:wrap;
-    padding:12px 16px;
+    display: flex; gap: 20px; flex-wrap: wrap;
+    padding: 12px 16px;
     background: var(--panel);
-    border:1px solid var(--border);
-    border-radius:6px;
-    margin-bottom:16px; font-size:14px;
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    margin-bottom: 16px;
+    font-size: 14px;
     color: var(--text);
   }
   .async-summary-strip strong { color: var(--accent-2); }
   .async-summary-strip .dim { color: var(--text-faint); }
   #bulk-publish-bar {
-    position:sticky; bottom:0;
+    position: sticky; bottom: 0;
     background: rgba(19,17,29,0.92);
     backdrop-filter: blur(8px);
-    border-top:2px solid var(--accent);
-    padding:14px 18px; margin-top:24px;
-    display:flex; justify-content:space-between; align-items:center; gap:12px;
+    border-top: 2px solid var(--accent);
+    padding: 14px 18px; margin-top: 24px;
+    display: flex; justify-content: space-between; align-items: center; gap: 12px;
     color: var(--text);
   }
   details summary { color: var(--text-dim); }
@@ -2474,9 +2617,49 @@ async def article_sync_review(request: Request, _: None = Depends(require_admin)
     </div>
     """
 
-    update_cards = "".join(
-        _render_update_card(it, edits.get(it["slug"]), pins, proposal_id) for it in updates
-    ) or '<p class="dim">No articles need updates in this proposal.</p>'
+    # Group update items by category for the section headers. Preserve
+    # the order in which categories first appear (which matches Plain's
+    # display order via plain_articles.iter_articles()). Within a category,
+    # items keep proposal order.
+    from collections import OrderedDict
+    by_category: "OrderedDict[str, list]" = OrderedDict()
+    for it in updates:
+        cat = it.get("group_name") or "(uncategorized)"
+        by_category.setdefault(cat, []).append(it)
+
+    update_sections = []
+    for cat, cat_items in by_category.items():
+        cards = "".join(
+            _render_update_card(it, edits.get(it["slug"]), pins, proposal_id)
+            for it in cat_items
+        )
+        # First category open by default so the page has something visible
+        # without making the user click; subsequent categories collapsed.
+        open_attr = "open" if cat == next(iter(by_category)) else ""
+        # Count edited/pinned in this category for the header glance
+        n_edited = sum(1 for it in cat_items if edits.get(it["slug"]))
+        n_pinned = sum(1 for it in cat_items if it["slug"] in pins)
+        detail_bits = [f"{len(cat_items)} need update"]
+        if n_edited:
+            detail_bits.append(f"{n_edited} edited")
+        if n_pinned:
+            detail_bits.append(f"{n_pinned} pinned")
+        update_sections.append(f"""
+        <details class="async-category" {open_attr}>
+          <summary>
+            <span>
+              <span class="async-category-chevron">▸</span>
+              {_esc(cat)}
+            </span>
+            <span class="async-category-counts">{' · '.join(detail_bits)}</span>
+          </summary>
+          <div class="async-category-body">
+            {cards}
+          </div>
+        </details>
+        """)
+    update_cards_html = ("".join(update_sections)
+                        or '<p class="dim">No articles need updates in this proposal.</p>')
 
     newtopic_cards = "".join(
         _render_new_topic_card(it, edits.get(it["slug"]), proposal_id) for it in newtopic
@@ -2530,7 +2713,7 @@ async def article_sync_review(request: Request, _: None = Depends(require_admin)
     {pin_section}
 
     <h2 style="margin-top:24px;">✏️ Articles needing updates ({len(updates)})</h2>
-    {update_cards}
+    {update_cards_html}
 
     <h2 style="margin-top:32px;">✨ New-topic suggestions ({len(newtopic)})</h2>
     <p class="dim">

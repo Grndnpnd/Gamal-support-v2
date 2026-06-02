@@ -1,44 +1,30 @@
 """
 plain_articles.py
 -----------------
-Hard-coded map of the 22 customer-facing help center articles at help.bankr.bot.
+Plain help-center configuration and category lookup.
 
-Each article entry carries:
-  - slug                 — URL slug (the identity Plain uses)
-  - title                — customer-facing title, phrased as a real user
-                           question ("How Do I Place a Trade?" not "Trading
-                           Documentation"). See WRITING GUIDELINES below.
-  - plain_id             — Plain article ID (hca_...). Lets the propose
-                           pipeline target an existing article for update
-                           without a slug→ID lookup round-trip.
-  - group_id             — Plain article-group ID (hcag_...). Required when
-                           creating a brand-new article.
-  - group_name           — human label for the group, used in the proposal UI.
-  - docs_sections        — list of strings to match against docs.bankr.bot
-                           section headers, so the propose pipeline knows
-                           which slice(s) of the docs feed this article. Match
-                           is case-insensitive substring against header text.
+WHAT THIS FILE OWNS (still active):
+  - HELP_CENTER_ID         — the public Bankr help center
+  - GROUPS / _GROUP_NAMES  — category ID ↔ name mappings (Plain has no
+                             discovery query for these, so we hardcode)
+  - group_id_by_name()     — Pass 2 LLM returns a category name string;
+                             the publish step needs the hcag_... ID
 
-The IDs and slugs in this file were captured live from Plain on 2026-06-01.
-They are the ground-truth state of the help center at help.bankr.bot. If
-articles are added/removed/renamed in Plain, this file needs a code change
-to match — re-run the dump script and update the ARTICLES list below.
+WHAT THIS FILE NO LONGER DRIVES (kept for now but unused by the pipeline):
+  - ARTICLES list and the iter_articles / get_by_slug / get_by_plain_id /
+    slug_to_plain_id_map / slugs_missing_plain_id / resolve_missing_ids
+    helpers.
 
-Adding / removing articles is rare and requires a code change here +
-a deploy. That tradeoff is acceptable: 22 articles maintained by a small
-team isn't worth a config UI for.
+  The sync pipeline used to iterate over ARTICLES to decide which articles
+  to judge. That broke whenever a new article was published through this
+  very feature — the static list immediately fell out of date and the
+  newly-published article wouldn't appear in the next proposal.
 
-WRITING GUIDELINES (used by the propose LLM prompt — single source of truth):
-  - Plain language, not developer docs. "Smart friend explaining" not "API
-    reference for developers."
-  - Title is a real user question. "How Do I Place a Trade?" / "What Are
-    DCA and TWAP Orders?" not "Trading Documentation."
-  - Practical numbered steps the user can follow.
-  - Example prompts users can copy/paste into Bankr.
-  - Link to docs.bankr.bot at the end for technical deep dives.
-  - Common troubleshooting tips where relevant.
-  - Code examples minimal — only when truly necessary.
-  - Tone: friendly, direct, confident — knowledgeable friend, not corporate.
+  As of 2026-06-01, article_sync.propose() iterates over the live Plain
+  fetch (plain_client.get_help_center_articles) and treats that as the
+  single source of truth for "what articles exist". The ARTICLES list
+  below is now dead code, left in place to avoid bundling code-removal
+  with the bug fix. A future commit can delete it cleanly.
 """
 
 # Help center the articles live in (the public Bankr help center).

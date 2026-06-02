@@ -595,23 +595,28 @@ async def propose(
     plain_by_slug = {a["slug"]: a for a in plain_arts}
     notes.append(f"Fetched {len(plain_arts)} live article(s) from Plain.")
 
-    # Bootstrap the article-map's hca_NEEDS_LOOKUP placeholders by matching
-    # slugs to live Plain article IDs. We don't mutate the file — we just
-    # carry the resolved IDs on the Proposal so a follow-up commit can
-    # update plain_articles.py.
-    resolved = plain_articles.resolve_missing_ids_from_live(plain_arts)
-    if resolved:
-        notes.append(
-            f"Resolved {len(resolved)} placeholder article ID(s) from live Plain: "
-            + ", ".join(f"{s}→{i}" for s, i in resolved.items())
-        )
-
     # ── PASS 1: Freshness check, per article ─────────────────────────────
-    log.info("Pass 1: judging freshness of each of 22 articles...")
-    total_articles = len(list(plain_articles.iter_articles()))
+    log.info(f"Pass 1: judging freshness of each of {len(plain_arts)} articles...")
+    total_articles = len(plain_arts)
     pass1_done = 0
     pass1_lock = asyncio.Lock()
     await _emit(f"Pass 1: judging articles (0/{total_articles})")
+
+    # Normalize Plain's article shape into the dict shape Pass 1 expects.
+    # The article-map in plain_articles.py used to be the iteration source,
+    # but that's brittle — the map immediately falls out of date the moment
+    # this very feature publishes a new article through Plain. Live fetch
+    # is the only durable source of truth for "what articles exist".
+    live_entries: list[dict] = []
+    for a in plain_arts:
+        grp = a.get("articleGroup") or {}
+        live_entries.append({
+            "slug":       a.get("slug") or "",
+            "title":      a.get("title") or "",
+            "plain_id":   a.get("id") or "",
+            "group_id":   grp.get("id") or "",
+            "group_name": grp.get("name") or "(Uncategorized)",
+        })
 
     async def _judge_with_chunks(entry):
         nonlocal pass1_done
@@ -634,7 +639,7 @@ async def propose(
         await _emit(f"Pass 1: judging articles ({done_now}/{total_articles})")
         return entry, chunks, result
 
-    # Bound concurrency so we don't fire 22 LLM calls in parallel and trip
+    # Bound concurrency so we don't fire N LLM calls in parallel and trip
     # rate limits on Bankr or Ollama Cloud. 3 at a time is plenty fast and
     # very polite.
     sem = asyncio.Semaphore(3)
@@ -643,22 +648,13 @@ async def propose(
         async with sem:
             return await _judge_with_chunks(entry)
 
-    pass1_results = await asyncio.gather(*[
-        _bounded(e) for e in plain_articles.iter_articles()
-    ])
+    pass1_results = await asyncio.gather(*[_bounded(e) for e in live_entries])
 
     items: list[ProposalItem] = []
     for entry, chunks, result in pass1_results:
         total_in  += result["tokens_in"]
         total_out += result["tokens_out"]
 
-        # Resolve the Plain ID — either from the article-map, or from the
-        # bootstrap resolution against live data, or from the per-slug fetch.
-        plain_id = entry["plain_id"]
-        if plain_id == "hca_NEEDS_LOOKUP":
-            plain_id = resolved.get(entry["slug"]) or (
-                plain_by_slug.get(entry["slug"]) or {}
-            ).get("id")
         current_html = (plain_by_slug.get(entry["slug"]) or {}).get("contentHtml")
         # Best chunk's text serves as a docs_excerpt preview in the review UI
         excerpt = (chunks[0]["text"][:400] + "…") if chunks else None
@@ -671,7 +667,7 @@ async def propose(
             kind=decision,
             slug=entry["slug"],
             title=str(new_article.get("title") or entry["title"]),
-            plain_id=plain_id,
+            plain_id=entry["plain_id"],
             group_id=entry["group_id"],
             group_name=entry["group_name"],
             current_html=current_html,
@@ -703,7 +699,7 @@ async def propose(
     # That's the right baseline for "do we still need a new article?".
     items_by_slug = {it.slug: it for it in items}
     enriched_existing: list[dict] = []
-    for entry in plain_articles.iter_articles():
+    for entry in live_entries:
         it = items_by_slug.get(entry["slug"])
         body_html = ""
         if it:
