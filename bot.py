@@ -323,12 +323,21 @@ class PlainTicketManager:
         issue_summary: str,
         full_context: str,
         bot_user: discord.ClientUser | None = None,
+        for_user: discord.Member | discord.User | None = None,
     ) -> discord.Thread | None:
         """
         Full flow: upsert customer → create Plain thread → create Discord thread → link them.
         Returns the Discord Thread object on success, None on failure.
+
+        for_user: when provided, the ticket is opened on behalf of this user
+        instead of message.author. Used by the !openticket moderator command
+        so the Plain customer record + welcome ping go to the target user, not
+        the moderator who typed the command. message.channel is still used to
+        anchor the Discord thread (so it spawns in whatever channel the mod ran
+        the command in), and message.id is still used for the thread-field
+        metadata link back to the originating message.
         """
-        user = message.author
+        user = for_user or message.author
 
         if not self.plain.api_key:
             log.warning("PLAIN_API_KEY not set — ticket creation skipped")
@@ -759,6 +768,155 @@ Choose the single best-fit value from this fixed list ONLY:
             return any(p.search(content) for p in DISENGAGE_PATTERNS)
         return False
 
+    def _is_moderator(self, member: discord.Member) -> bool:
+        """
+        True if the member holds any role named in MOD_ROLE_NAME (the same env
+        var used to decide who gets added to ticket threads). Case-insensitive
+        match, comma-separated values supported.
+
+        Used to gate moderator-only commands like !openticket.
+
+        Returns False for non-Members (e.g. DM authors) — moderator status
+        is only meaningful inside a guild.
+        """
+        author_roles = getattr(member, "roles", None)
+        if not author_roles:
+            return False
+        mod_roles = {
+            r.strip().lower()
+            for r in MOD_ROLE_NAME.split(",")
+            if r.strip()
+        }
+        return any(role.name.lower() in mod_roles for role in author_roles)
+
+    async def _handle_openticket_command(self, message: discord.Message):
+        """
+        Moderator-only manual ticket opener. Bypasses the LLM escalation path
+        entirely, useful when a mod has already triaged a request and wants
+        to open the ticket without making the user dance through the bot's
+        usual "want a ticket? reply yes" flow.
+
+        Syntax:
+            !openticket @user [optional reason text]
+
+        The optional trailing text becomes the ticket subject and first
+        message body in Plain. If omitted, a default placeholder is used so
+        the agent sees *something* contextual rather than a blank ticket.
+
+        Refused if:
+          - the invoker isn't a moderator (silent — no reply, to avoid
+            broadcasting the command's existence to non-mods)
+          - no @mention is supplied (replies with usage help)
+          - the @mention isn't resolvable to a guild Member (e.g. mod typed
+            a raw ID; replies with a clear error)
+          - the target user is a bot (refused — bots don't open tickets)
+          - the target user already has an open ticket (forwards the
+            "you've already got one" reply, matching the LLM escalation
+            flow's behavior)
+
+        On success, posts a brief confirmation in the channel pointing to
+        the new private ticket thread.
+        """
+        # 1. Gate to moderators. Silent refusal — non-mods don't even learn
+        #    the command exists.
+        if not self._is_moderator(message.author):
+            log.info(
+                f"!openticket: refused for {message.author} (not a moderator)"
+            )
+            return
+
+        # 2. Require at least one user mention. (Bot's own mention doesn't count.)
+        targets = [m for m in message.mentions if m.id != self.user.id]
+        if not targets:
+            await message.reply(
+                "Usage: `!openticket @user [optional reason]`",
+                mention_author=False,
+            )
+            return
+        if len(targets) > 1:
+            await message.reply(
+                "I can only open one ticket at a time. Tag a single user.",
+                mention_author=False,
+            )
+            return
+
+        target = targets[0]
+        if target.bot:
+            await message.reply(
+                "Can't open a ticket for a bot.",
+                mention_author=False,
+            )
+            return
+
+        # 3. Pull the optional reason: everything after the @mention and the
+        #    !openticket word. We strip mentions out of the raw content the
+        #    same way _clean_content does for normal messages.
+        raw = message.content
+        for m in message.mentions:
+            raw = raw.replace(f"<@{m.id}>", "").replace(f"<@!{m.id}>", "")
+        reason = re.sub(r"^\s*!openticket\b", "", raw, flags=re.IGNORECASE).strip()
+        if not reason:
+            reason = (
+                f"Ticket opened manually by moderator {message.author.display_name}."
+            )
+
+        # 4. Plain integration must be live.
+        if not self.tickets:
+            await message.reply(
+                "Plain isn't configured — can't open a ticket.",
+                mention_author=False,
+            )
+            log.warning("!openticket: tickets manager not initialized")
+            return
+
+        # 5. Duplicate-ticket check — same behavior the LLM escalation flow
+        #    has when a user with an open ticket asks for another one.
+        existing_thread_id = self.tickets.user_has_open_ticket(target.id)
+        if existing_thread_id:
+            await message.reply(
+                f"{target.mention} already has an open ticket in "
+                f"<#{existing_thread_id}>.",
+                mention_author=False,
+            )
+            log.info(
+                f"!openticket: refused for {target} — already has ticket "
+                f"in {existing_thread_id}"
+            )
+            return
+
+        # 6. Open the ticket. The moderator's message anchors the Discord
+        #    thread (it spawns in their channel) and gives us the message_id
+        #    for thread-field metadata. for_user redirects the Plain customer
+        #    record + welcome ping to the target user instead of the mod.
+        issue_summary = reason[:80]
+        full_context = (
+            f"**Manually opened by moderator:** {message.author.display_name}\n\n"
+            f"**For user:** {target} ({target.display_name})\n\n"
+            f"**Reason:**\n{reason}"
+        )
+        discord_thread = await self.tickets.open_ticket(
+            message=message,
+            issue_summary=issue_summary,
+            full_context=full_context,
+            bot_user=self.user,
+            for_user=target,
+        )
+
+        if discord_thread:
+            await message.reply(
+                f"🎫 Opened a ticket for {target.mention} in {discord_thread.mention}.",
+                mention_author=False,
+            )
+            log.info(
+                f"!openticket: opened by {message.author} for {target} "
+                f"→ Discord thread {discord_thread.id}"
+            )
+        else:
+            await message.reply(
+                "Couldn't open the ticket — check the bot logs.",
+                mention_author=False,
+            )
+
     async def _disengage(self, message: discord.Message):
         self.conversations.clear(message.channel.id, message.author.id)
         # Also clear any pending ticket offer so it doesn't linger
@@ -1111,10 +1269,20 @@ Choose the single best-fit value from this fixed list ONLY:
         if success:
             await message.add_reaction("📨")
         else:
-            await message.reply(
-                "⚠️ Couldn't forward your message to our support team right now. Please try again.",
-                mention_author=False,
-            )
+            # Failure path: don't post the "Couldn't forward your message to our
+            # support team right now. Please try again." reply. After the
+            # send_chat migration (2026-06-02), the only way a forward fails
+            # is on legacy pre-fix tickets still on the email/reply_to_thread
+            # path — and those failures will trigger Plain's suppression-list
+            # error 100% of the time for fake-email customers. Showing a "try
+            # again" message just misleads the user since retrying can't work.
+            # We add a discreet ❗ reaction so the user knows something didn't
+            # land, and the error is still logged via plain_client for us.
+            try:
+                await message.add_reaction("❗")
+            except Exception:
+                # React permission could be missing; not worth a separate path.
+                pass
 
         # Log the user's ticket-thread message to the transcript. kind marks it
         # as a transcript-only row so the stats dashboard ignores it; the
@@ -1147,6 +1315,17 @@ Choose the single best-fit value from this fixed list ONLY:
             return
 
         if MONITORED_CHANNEL_IDS and message.channel.id not in MONITORED_CHANNEL_IDS:
+            return
+
+        # ── Moderator commands ──────────────────────────────────────────────
+        # !openticket runs before mention/intent checks so it short-circuits
+        # the bot's normal response paths. The handler self-gates to mods —
+        # non-mods who type it get silent treatment (no reply, no fall-through
+        # to intent detection). That keeps the command from being discoverable
+        # to random users while still being easy for mods to use.
+        if message.content.strip().lower().startswith("!openticket"):
+            self._handled_message_ids.add(message.id)
+            await self._handle_openticket_command(message)
             return
 
         is_mentioned = self.user in message.mentions
