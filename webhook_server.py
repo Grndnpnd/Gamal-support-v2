@@ -249,6 +249,92 @@ async def _mark_relayed(event_id: str):
         log.error(f"Webhook dedupe mark failed for {event_id}: {e}")
 
 
+# ─── Content-level dedupe ───────────────────────────────────────────────────
+#
+# Separate from event-id dedupe above, and additive. Event-id dedupe catches
+# Plain's own retries of the SAME event (Plain re-delivering pEv_X if it
+# didn't get a timely 200). Content dedupe catches a DIFFERENT failure mode:
+# Plain emitting two distinct events (different event IDs) that contain the
+# same logical message.
+#
+# Observed in production 2026-06-05: Plain's AI-agent feature posting one
+# reply emits two thread.email_sent events, ~6s apart, with different event
+# IDs. Event-id dedupe correctly treats them as distinct events; content
+# dedupe is what catches that they're semantically duplicates.
+#
+# Key: SHA-256 of (thread_id || message_text). We deliberately do NOT include
+# the agent name in the key — if the same content arrives "from" different
+# agents in quick succession, it's almost certainly the same logical event
+# re-delivered with different metadata, not two agents genuinely typing the
+# same thing.
+#
+# TTL: 60 seconds. Long enough to catch the 6-second double-emit we've seen
+# and any reasonable variation; short enough that an agent legitimately
+# saying the same thing later (e.g. follow-up "did you see my message?")
+# still gets posted.
+
+import hashlib as _hashlib
+
+_CONTENT_DEDUPE_KEY_PREFIX = "webhook:content:"
+_CONTENT_DEDUPE_TTL_SECONDS = 60
+
+
+def _content_dedupe_key(thread_id: str, message_text: str) -> str:
+    """Stable key for a (thread, message) tuple. SHA-256 to keep keys short."""
+    h = _hashlib.sha256()
+    h.update(thread_id.encode("utf-8"))
+    h.update(b"\x00")  # separator so different splits don't collide
+    h.update(message_text.encode("utf-8"))
+    return _CONTENT_DEDUPE_KEY_PREFIX + h.hexdigest()
+
+
+async def _content_already_relayed(thread_id: str, message_text: str) -> bool:
+    """
+    Return True if a message with the same (thread, content) has been
+    relayed in the last _CONTENT_DEDUPE_TTL_SECONDS. Read-only.
+
+    Like _already_relayed, this does NOT claim — claiming happens in
+    _mark_content_relayed, called only after the event is fully handled.
+
+    On any Redis error, returns False (treat as not-duplicate) so a dedupe-
+    store hiccup never blocks legitimate relays.
+    """
+    if not thread_id or not message_text:
+        return False
+    r = _get_dedupe_redis()
+    if r is None:
+        return False
+    try:
+        return await r.exists(_content_dedupe_key(thread_id, message_text)) == 1
+    except Exception as e:
+        log.error(f"Content dedupe check failed: {e} — processing anyway")
+        return False
+
+
+async def _mark_content_relayed(thread_id: str, message_text: str) -> None:
+    """
+    Record that a message with this (thread, content) was just relayed, so a
+    subsequent event carrying the same content within the TTL window is
+    recognized as a duplicate.
+
+    Best-effort: a Redis failure here just means a possible double-post if
+    the duplicate event arrives in the next few seconds — acceptable.
+    """
+    if not thread_id or not message_text:
+        return
+    r = _get_dedupe_redis()
+    if r is None:
+        return
+    try:
+        await r.set(
+            _content_dedupe_key(thread_id, message_text),
+            "1",
+            ex=_CONTENT_DEDUPE_TTL_SECONDS,
+        )
+    except Exception as e:
+        log.error(f"Content dedupe mark failed: {e}")
+
+
 # ─── Signature Verification ──────────────────────────────────────────────────
 #
 # Plain signs outbound webhook requests with HMAC-SHA256 using a workspace-level
@@ -419,11 +505,29 @@ async def handle_plain_webhook(request: web.Request) -> web.Response:
         log.warning(f"No Discord thread mapped for Plain thread {thread_id}")
         return web.Response(status=200, text="OK")
 
+    # Content-level dedupe — catches the case where Plain emits two distinct
+    # events (different event IDs) with the same logical message. Observed
+    # in production with Plain's AI-agent feature: one reply produces two
+    # thread.email_sent events ~6s apart. Event-id dedupe treats them as
+    # different events (which they are); this check catches that they're
+    # semantically duplicates and stops the second from being posted.
+    if await _content_already_relayed(thread_id, message_text):
+        log.info(
+            f"Duplicate content for thread {thread_id} within "
+            f"{_CONTENT_DEDUPE_TTL_SECONDS}s window — skipping (event {event_id})"
+        )
+        # Still mark the event_id so a Plain retry of THIS specific event
+        # doesn't get re-processed and re-checked.
+        if event_id:
+            await _mark_relayed(event_id)
+        return web.Response(status=200, text="OK")
+
     # Mark as relayed before posting so retries are caught even if posting is
     # slow. Placed AFTER the thread-mapping check above, so an event that
     # couldn't be mapped is left unmarked and a later retry can still land.
     if event_id:
         await _mark_relayed(event_id)
+    await _mark_content_relayed(thread_id, message_text)
 
     # Resolve agent name from createdBy.user (Plain's structure for user actors)
     thread_obj = payload.get("thread", {}) or {}
