@@ -37,7 +37,12 @@ import aiohttp
 import discord
 from aiohttp import web
 from dotenv import load_dotenv
-from redis_map import get_discord_thread_id, is_using_redis
+from redis_map import (
+    get_discord_thread_id,
+    is_using_redis,
+    get_user_for_thread,
+    delete_active_ticket,
+)
 import db
 
 load_dotenv()
@@ -442,6 +447,36 @@ async def handle_plain_webhook(request: web.Request) -> web.Response:
         if new_status.upper() in ("DONE", "RESOLVED"):
             discord_thread_id = await get_discord_thread_id(thread_id)
             if discord_thread_id:
+                # Clean up the active-ticket Redis hashes before deleting the
+                # Discord thread. This used to happen ONLY when the user typed
+                # !close in Discord (bot.py owns that path and calls
+                # close_ticket → delete_active_ticket). The Plain-side resolve
+                # path was deleting the Discord thread but leaving the
+                # user_tickets / active_tickets / ticket_customers hashes
+                # populated forever, so when the same user came back later the
+                # bot's user_has_open_ticket() returned a dead thread ID and
+                # tried to forward to <#deleted>, rendering as ⁠unknown in
+                # Discord. Fixed 2026-06-10 — clean state on this path too.
+                #
+                # We look up the user_id from the user_tickets hash (inverse
+                # of the normal lookup) because the webhook only knows the
+                # Plain thread id and the Discord thread id, not which user
+                # owns the ticket.
+                user_id = await get_user_for_thread(int(discord_thread_id))
+                if user_id is not None:
+                    await delete_active_ticket(int(discord_thread_id), user_id)
+                    log.info(
+                        f"Cleaned active-ticket state for resolved Plain thread "
+                        f"{thread_id} (user={user_id}, discord_thread={discord_thread_id})"
+                    )
+                else:
+                    # No user mapping — either already cleaned, or the user
+                    # entry was lost somehow. Log it and continue; the
+                    # Discord thread deletion below still proceeds.
+                    log.warning(
+                        f"Resolved Plain thread {thread_id} → Discord {discord_thread_id} "
+                        f"but no user_tickets entry found; state may already be clean"
+                    )
                 # Schedule deletion with 10s countdown + !keep cancellation
                 asyncio.ensure_future(
                     schedule_thread_deletion(int(discord_thread_id), triggered_by="Plain team")

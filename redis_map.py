@@ -271,3 +271,38 @@ async def get_customer_for_thread(discord_thread_id: int) -> str | None:
         except Exception as e:
             log.error(f"Redis get_customer_for_thread failed: {e}")
     return _ticket_customers_mem.get(discord_thread_id)
+
+
+async def get_user_for_thread(discord_thread_id: int) -> int | None:
+    """
+    Inverse lookup: find which Discord user owns a given ticket thread.
+
+    `user_tickets` is stored as user_id → discord_thread_id (the direction
+    bot.py reads on the hot path). For ticket-resolution cleanup, the
+    webhook server has the discord_thread_id but needs the user_id to pass
+    into delete_active_ticket. This walks the hash to find the match.
+
+    Performance: user_tickets only has one entry per currently-open ticket
+    — typically <20 entries, so a full HGETALL + linear scan is fine and
+    avoids adding a fourth hash to keep in sync. If the open-ticket count
+    ever grew past hundreds, swap to a thread→user reverse hash.
+
+    Returns None if no user owns this thread (already cleaned up, or
+    Discord thread was orphaned).
+    """
+    target = str(discord_thread_id)
+    r = _get_redis()
+    if r:
+        try:
+            raw = await r.hgetall(USER_TICKETS_KEY)
+            for user_id, thread_id in raw.items():
+                if thread_id == target:
+                    return int(user_id)
+            return None
+        except Exception as e:
+            log.error(f"Redis get_user_for_thread failed: {e}")
+    # In-memory fallback
+    for user_id, thread_id in _user_tickets_mem.items():
+        if thread_id == discord_thread_id:
+            return user_id
+    return None

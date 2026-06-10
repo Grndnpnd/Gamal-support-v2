@@ -317,6 +317,72 @@ class PlainTicketManager:
         """Returns the Discord thread ID of the user's open ticket, or None."""
         return self._user_tickets.get(user_id)
 
+    async def user_has_open_ticket_validated(
+        self,
+        user_id: int,
+        bot_client: discord.Client,
+    ) -> int | None:
+        """
+        Same as user_has_open_ticket, but verifies the Discord thread still
+        exists before returning the id. If our state says the user has a
+        ticket but the Discord thread is gone (deleted manually, or our
+        cleanup was incomplete in some past state), this self-heals by
+        clearing the stale entry and returning None.
+
+        Background: in production we observed `user_tickets` entries
+        persisting past their Discord thread's deletion — the webhook
+        server used to delete the Discord thread without cleaning the
+        Redis hash on agent-resolved tickets. Users coming back later
+        would get told they had an open ticket in <#deleted> which Discord
+        rendered as ⁠unknown. The cross-process cleanup is fixed at the
+        source (webhook_server.py now calls delete_active_ticket on
+        resolution), but this validation gives defense-in-depth against
+        any other path that could leave the same state.
+
+        Cost: one fetch_channel call when the user has an apparent open
+        ticket — small, and only on the ticket-creation path. Returns None
+        with no Discord call if the user has no apparent ticket at all.
+        """
+        thread_id = self._user_tickets.get(user_id)
+        if thread_id is None:
+            return None
+
+        # Try the cache first (free), then fetch (one API call) before giving up.
+        channel = bot_client.get_channel(thread_id)
+        if channel is None:
+            try:
+                channel = await bot_client.fetch_channel(thread_id)
+            except discord.NotFound:
+                # The thread is genuinely gone. Self-heal.
+                log.info(
+                    f"Stale ticket state for user {user_id} → thread {thread_id} "
+                    f"(Discord thread no longer exists); cleaning up"
+                )
+                await self.close_ticket(thread_id, user_id)
+                return None
+            except discord.Forbidden:
+                # We can't see the thread for permissions reasons, but it
+                # might still exist. Don't clean state on a permissions
+                # error — that could erase a real ticket. Return the id
+                # and let the caller treat the user as having an open
+                # ticket (which is at worst conservative).
+                log.warning(
+                    f"Couldn't verify thread {thread_id} for user {user_id} "
+                    f"(forbidden); assuming ticket still open"
+                )
+                return thread_id
+            except Exception as e:
+                # Network blip, rate limit, anything else. Same conservative
+                # call as Forbidden — don't erase state on transient errors.
+                log.warning(
+                    f"Couldn't verify thread {thread_id} for user {user_id} "
+                    f"({type(e).__name__}: {e}); assuming ticket still open"
+                )
+                return thread_id
+
+        # Channel exists — ticket is real.
+        return thread_id
+
     async def open_ticket(
         self,
         message: discord.Message,
@@ -870,8 +936,12 @@ Choose the single best-fit value from this fixed list ONLY:
             return
 
         # 5. Duplicate-ticket check — same behavior the LLM escalation flow
-        #    has when a user with an open ticket asks for another one.
-        existing_thread_id = self.tickets.user_has_open_ticket(target.id)
+        #    has when a user with an open ticket asks for another one. Use
+        #    the validated version so a stale entry (Discord thread gone but
+        #    Redis hash not cleaned) doesn't refuse a legitimate new ticket.
+        existing_thread_id = await self.tickets.user_has_open_ticket_validated(
+            target.id, self
+        )
         if existing_thread_id:
             await message.reply(
                 f"{target.mention} already has an open ticket in "
@@ -969,8 +1039,13 @@ Choose the single best-fit value from this fixed list ONLY:
                 None,
             )
 
-        # User already has an open ticket — forward to it instead
-        existing_thread_id = self.tickets.user_has_open_ticket(message.author.id)
+        # User already has an open ticket — forward to it instead. Validate
+        # first so a stale entry (Discord thread gone, Redis hash not cleaned)
+        # falls through to fresh-ticket creation rather than forwarding to
+        # <#deleted_thread> which Discord renders as ⁠unknown.
+        existing_thread_id = await self.tickets.user_has_open_ticket_validated(
+            message.author.id, self
+        )
         if existing_thread_id:
             full_context = self._build_ticket_context(message, original_content)
             await self.tickets.forward_to_plain(existing_thread_id, message.author, original_content)
