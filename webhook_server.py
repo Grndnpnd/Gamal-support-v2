@@ -273,15 +273,20 @@ async def _mark_relayed(event_id: str):
 # re-delivered with different metadata, not two agents genuinely typing the
 # same thing.
 #
-# TTL: 60 seconds. Long enough to catch the 6-second double-emit we've seen
-# and any reasonable variation; short enough that an agent legitimately
-# saying the same thing later (e.g. follow-up "did you see my message?")
-# still gets posted.
+# TTL: 30 minutes. Originally 60s, set against an observed ~6s double-emit
+# pattern. Production logs later showed a SECOND duplication pattern: Plain's
+# AI agent re-emits its previous reply verbatim ~20-22 minutes after the
+# original (suspected inactivity follow-up flow on Plain's side that fires
+# even when there's nothing new to say). 30 minutes gives ~8 min of margin
+# over the worst observed gap. Tradeoff: an agent legitimately re-sending
+# the byte-identical text within 30 minutes gets swallowed — in practice
+# this doesn't happen, since humans paraphrase and the only thing we've
+# seen send identical text is the misbehaving AI agent.
 
 import hashlib as _hashlib
 
 _CONTENT_DEDUPE_KEY_PREFIX = "webhook:content:"
-_CONTENT_DEDUPE_TTL_SECONDS = 60
+_CONTENT_DEDUPE_TTL_SECONDS = 1800
 
 
 def _content_dedupe_key(thread_id: str, message_text: str) -> str:
@@ -542,14 +547,17 @@ async def handle_plain_webhook(request: web.Request) -> web.Response:
 
     # Content-level dedupe — catches the case where Plain emits two distinct
     # events (different event IDs) with the same logical message. Observed
-    # in production with Plain's AI-agent feature: one reply produces two
-    # thread.email_sent events ~6s apart. Event-id dedupe treats them as
-    # different events (which they are); this check catches that they're
-    # semantically duplicates and stops the second from being posted.
+    # in production with Plain's AI-agent feature: a single reply produces two
+    # thread.email_sent events with different event IDs. We've observed two
+    # patterns — ~6s apart (fast double-emit) and ~20-22min apart (suspected
+    # inactivity follow-up flow that re-emits the previous reply verbatim).
+    # Event-id dedupe treats them as different events (which they are); this
+    # check catches that they're semantically duplicates.
     if await _content_already_relayed(thread_id, message_text):
         log.info(
             f"Duplicate content for thread {thread_id} within "
-            f"{_CONTENT_DEDUPE_TTL_SECONDS}s window — skipping (event {event_id})"
+            f"{_CONTENT_DEDUPE_TTL_SECONDS // 60}-minute window — "
+            f"skipping (event {event_id})"
         )
         # Still mark the event_id so a Plain retry of THIS specific event
         # doesn't get re-processed and re-checked.
