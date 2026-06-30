@@ -2905,6 +2905,7 @@ async def article_sync_publish(request: Request, _: None = Depends(require_admin
             plain_id     = item.get("plain_id") if not is_new else None,
             description  = eff["effective_description"] or None,
             group_id     = item.get("group_id") or None,
+            status       = item.get("status") or None,
         ))
 
     plain_api_key = os.getenv("PLAIN_API_KEY", "")

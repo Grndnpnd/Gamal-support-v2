@@ -69,6 +69,8 @@ class ProposalItem:
     plain_id:      Optional[str] = None
     group_id:      str = ""
     group_name:    str = ""
+    status:        Optional[str] = None    # existing Plain status (PUBLISHED/DRAFT)
+                                           # preserved so updates don't unpublish
     current_html:  Optional[str] = None
     proposed_html: Optional[str] = None
     proposed_description: Optional[str] = None
@@ -616,6 +618,7 @@ async def propose(
             "plain_id":   a.get("id") or "",
             "group_id":   grp.get("id") or "",
             "group_name": grp.get("name") or "(Uncategorized)",
+            "status":     a.get("status") or "",
         })
 
     async def _judge_with_chunks(entry):
@@ -670,6 +673,7 @@ async def propose(
             plain_id=entry["plain_id"],
             group_id=entry["group_id"],
             group_name=entry["group_name"],
+            status=entry.get("status") or None,
             current_html=current_html,
             # Strip any leading <h1>Title</h1> the LLM may have included
             # despite the prompt — see _sanitize_proposed_html docstring.
@@ -897,6 +901,9 @@ class PublishItem:
     plain_id:      Optional[str] = None  # required when is_new=False
     description:   Optional[str] = None
     group_id:      Optional[str] = None
+    status:        Optional[str] = None  # existing status to preserve on update
+                                         # (Plain requires status on EVERY upsert,
+                                         # despite introspecting as optional)
 
 
 async def publish_items(
@@ -937,10 +944,15 @@ async def publish_items(
                 article_group_id = it.group_id,
                 description      = it.description,
                 slug             = it.slug if it.is_new else None,
-                # Status defaults: new articles go in as drafts so a human
-                # can review the live preview before publishing. Updates
-                # keep their existing status.
-                status           = "DRAFT" if it.is_new else None,
+                # Plain requires `status` on EVERY upsert, including updates
+                # (it introspects as optional but the runtime validator rejects
+                # its absence with input_validation/REQUIRED). New articles go
+                # in as DRAFT so a human reviews the live preview before
+                # publishing. Updates echo back the article's CURRENT status so
+                # editing a live (PUBLISHED) article doesn't silently unpublish
+                # it; the `or "DRAFT"` is a safety net if status didn't come
+                # through — fail safe toward draft, never accidental publish.
+                status           = "DRAFT" if it.is_new else (it.status or "DRAFT"),
             )
             # PlainClient.upsert_help_center_article returns the article dict
             # directly ({id, slug, title, status}) on success, None on any

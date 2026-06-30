@@ -656,7 +656,10 @@ class PlainClient:
           icon                     String                   optional
           contentHtml              String                   required
           slug                     String                   optional
-          status                   HelpCenterArticleStatus  optional
+          status                   HelpCenterArticleStatus  *introspects as
+                                     optional but is RUNTIME-REQUIRED* — Plain
+                                     rejects an upsert with no status via
+                                     input_validation/REQUIRED. Always pass it.
 
         Two usage modes:
           1. Update existing — pass article_id to target the article. The
