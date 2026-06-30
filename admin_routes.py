@@ -2180,6 +2180,74 @@ def _render_update_card(item: dict, edit: Optional[dict], pins: dict, proposal_i
             '</div>'
         )
 
+    # Spin-off suggestions: facts the audit judged worthy of their own NEW
+    # article rather than being crammed in here.
+    spinoffs      = item.get("spinoff_suggestions") or []
+    spinoff_badge = ""
+    spinoff_block = ""
+    if spinoffs:
+        spinoff_badge = (
+            f'<span class="badge" style="background:rgba(128,93,238,0.18);" '
+            f'title="Audit suggests new article(s) for out-of-scope content">'
+            f'🔖 {len(spinoffs)} new-article idea(s)</span>'
+        )
+        groups = ""
+        for s in spinoffs:
+            facts = "".join(
+                f'<li>{_esc(f.get("fact") or "")}</li>' for f in s.get("facts", [])
+            )
+            groups += (
+                f'<div style="margin-bottom:6px;">'
+                f'<div style="font-weight:600;">📄 {_esc(s.get("suggested_article") or "")}</div>'
+                f'<ul style="margin:2px 0 0; padding-left:18px; font-size:13px;">{facts}</ul>'
+                f'</div>'
+            )
+        spinoff_block = (
+            '<div style="margin:8px 0; padding:10px 12px; border-left:3px solid '
+            'var(--accent,#805dee); background:rgba(128,93,238,0.08); '
+            'border-radius:4px;">'
+            '<div style="font-weight:600; margin-bottom:4px;">'
+            '🔖 Suggested new article(s)</div>'
+            '<div class="dim" style="font-size:12px; margin-bottom:6px;">'
+            'This content is documented but doesn\'t fit this article\'s scope — '
+            'it likely deserves its own article rather than being added here.</div>'
+            f'{groups}</div>'
+        )
+
+    # Routing hints: facts that belong in another EXISTING article.
+    routes       = item.get("existing_routes") or []
+    route_badge  = ""
+    route_block  = ""
+    if routes:
+        route_badge = (
+            f'<span class="badge" style="background:rgba(255,225,67,0.20);" '
+            f'title="Audit found facts that belong in other existing articles">'
+            f'↪ {len(routes)} routing hint(s)</span>'
+        )
+        groups = ""
+        for r in routes:
+            facts = "".join(
+                f'<li>{_esc(f.get("fact") or "")}</li>' for f in r.get("facts", [])
+            )
+            groups += (
+                f'<div style="margin-bottom:6px;">'
+                f'<div style="font-weight:600;">↪ {_esc(r.get("target_title") or "")} '
+                f'<code>{_esc(r.get("target_slug") or "")}</code></div>'
+                f'<ul style="margin:2px 0 0; padding-left:18px; font-size:13px;">{facts}</ul>'
+                f'</div>'
+            )
+        route_block = (
+            '<div style="margin:8px 0; padding:10px 12px; border-left:3px solid '
+            'var(--yellow,#ffe143); background:rgba(255,225,67,0.10); '
+            'border-radius:4px;">'
+            '<div style="font-weight:600; margin-bottom:4px;">'
+            '↪ Belongs in other existing article(s)</div>'
+            '<div class="dim" style="font-size:12px; margin-bottom:6px;">'
+            'These facts surfaced here but fit an existing article better. '
+            'Consider adding them there (they were NOT inlined into this one).</div>'
+            f'{groups}</div>'
+        )
+
     pin_badge = ""
     if is_pinned:
         pin_badge = (
@@ -2210,7 +2278,7 @@ def _render_update_card(item: dict, edit: Optional[dict], pins: dict, proposal_i
           </div>
         </div>
         <div class="async-card-summary-controls" onclick="event.stopPropagation();">
-          {pin_badge}{edited_badge}{audit_badge}
+          {pin_badge}{edited_badge}{audit_badge}{spinoff_badge}{route_badge}
           <label{publish_label_dim} class="async-publish-lbl">
             <input type="checkbox" name="publish_slugs" value="{_esc(slug)}"
                    form="bulk-publish-form" {publish_disabled}>
@@ -2225,6 +2293,8 @@ def _render_update_card(item: dict, edit: Optional[dict], pins: dict, proposal_i
 
       <div class="async-card-body">
         {audit_block}
+        {spinoff_block}
+        {route_block}
         <div class="dim" style="font-size:12px; margin-bottom:8px;">
           <code>{_esc(slug)}</code>
           {f' · Plain ID: <code>{_esc(plain_id)}</code>' if plain_id else ''}

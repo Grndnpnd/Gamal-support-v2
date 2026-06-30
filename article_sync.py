@@ -83,6 +83,15 @@ class ProposalItem:
                                 # Surfaced in the review UI as a warning so a
                                 # human can eyeball before publishing. Empty =
                                 # audit found nothing missing (the good case).
+    spinoff_suggestions: list = field(default_factory=list)
+                                # audit facts that warrant their own NEW article.
+                                # Each: {suggested_article, facts:[...]}. Surfaced
+                                # as "consider creating this article" hints — NOT
+                                # inlined into this article.
+    existing_routes: list = field(default_factory=list)
+                                # audit facts that belong in another EXISTING
+                                # article. Each: {target_slug, target_title,
+                                # facts:[...]}. Surfaced as routing hints.
 
 # kind values:
 #   "unchanged"     article still reflects the docs — no action needed
@@ -563,14 +572,25 @@ Respond ONLY with a single JSON object. No preamble, no markdown fence:
 # so a human sees them in the review UI before publishing.
 
 def _audit_system_prompt() -> str:
-    return """You are auditing a drafted Bankr help center article for COMPLETENESS against the source documentation excerpts it was written from.
+    return """You are auditing a drafted Bankr help center article for COMPLETENESS against the source documentation excerpts it was written from — and deciding WHERE each missing fact belongs.
 
 You will receive:
-- "source_chunks": the documentation excerpts the article should faithfully cover.
+- "article_title": the article's title (signals its scope/altitude).
 - "article_html": the drafted article body.
+- "source_chunks": the documentation excerpts the article was written from.
+- "other_articles": the list of OTHER help center articles that already exist,
+  as {slug, title}. Use this to recognize when a missing fact already has a
+  better home.
 
-Find every fact in source_chunks that a support reader would need but that is
-MISSING from article_html. Focus hard on the high-stakes kinds of facts:
+STEP 1 — Judge this article's SCOPE from its title and body:
+- An ORIENTATION article (e.g. "What is Bankr?", "Getting Started", an overview
+  or introduction) should stay high-level: it introduces capabilities and points
+  to detail, it does NOT contain every subsystem's full walkthrough.
+- A FOCUSED article (e.g. "How Do I Launch a Token?", "Using the CLI") should be
+  thorough about ITS specific topic.
+
+STEP 2 — Find every fact in source_chunks that a support reader would need but
+that is MISSING from article_html. Focus on high-stakes facts:
 - Limitations / restrictions ("cannot", "only", "not supported", "no longer").
 - Irreversible or locked-at-a-point-in-time facts ("fixed at launch", "can't be
   reassigned", "permanent").
@@ -578,12 +598,32 @@ MISSING from article_html. Focus hard on the high-stakes kinds of facts:
   something, what transfers and what does NOT, fees, cliffs, vesting, caps).
 - Prerequisites and gotchas; exceptions and special cases.
 
+STEP 3 — For EACH missing fact, decide its PLACEMENT (exactly one):
+- "this_article" — the fact belongs in THIS article at its altitude. On a
+  FOCUSED article that's the full detail; on an ORIENTATION article only a BRIEF
+  mention + pointer is appropriate (don't inline a whole walkthrough).
+- "existing_article" — the fact more naturally belongs in one of the OTHER
+  articles that ALREADY EXIST (see other_articles), not here. Choose this when a
+  fact surfaced while editing this article but its real home is a different
+  existing article (e.g. a vesting-transfer caveat that belongs in the existing
+  "Launching a Token" article, not in "What is Bankr?"). Name it via
+  "target_slug" — it MUST be a slug from other_articles.
+- "new_article" — the fact is part of a larger topic substantial enough to
+  deserve its OWN NEW article that does not exist yet, rather than being stuffed
+  in here (e.g. a full CLI setup walkthrough → a dedicated "Using the Bankr CLI"
+  article). Name the proposed article via "suggested_article".
+
+Decision order: prefer "this_article" if it genuinely fits this article's scope.
+Otherwise, if a suitable existing article is in other_articles, choose
+"existing_article". Only choose "new_article" when no existing article fits AND
+the topic is substantial enough to stand alone. Completeness of the HELP CENTER
+does not require every fact in every article — it requires every fact in the
+RIGHT article.
+
 Do NOT report:
 - Stylistic differences, wording, ordering, or formatting.
-- Developer/API minutiae that genuinely doesn't belong in a user help article
-  (raw endpoint schemas, internal contract ABIs) UNLESS the user-facing
-  consequence is missing (the consequence must be stated even if the mechanism
-  isn't).
+- Raw developer/API minutiae (endpoint schemas, contract ABIs) UNLESS the
+  user-facing consequence is missing (state the consequence, not the mechanism).
 - Facts already present in the article, even if phrased differently.
 
 Respond ONLY with a single JSON object, no preamble, no markdown fence:
@@ -592,7 +632,10 @@ Respond ONLY with a single JSON object, no preamble, no markdown fence:
     {
       "fact": "Short statement of the missing fact, in plain language.",
       "severity": "high" | "medium" | "low",
-      "why": "One short clause on why a user needs this."
+      "why": "One short clause on why a user needs this.",
+      "placement": "this_article" | "existing_article" | "new_article",
+      "target_slug": "existing-article-slug (only when placement is existing_article; else omit/null)",
+      "suggested_article": "Proposed title (only when placement is new_article; else omit/null)"
     }
   ]
 }
@@ -602,22 +645,37 @@ If nothing material is missing, return {"missing": []}."""
 async def _audit_article_completeness(
     router: "LLMRouter",
     *,
+    article_title: str,
     article_html: str,
     docs_chunks: list[dict],
+    other_articles: Optional[list[dict]] = None,
 ) -> list[dict]:
     """
-    Run the completeness audit. Returns a list of missing-fact dicts
-    (possibly empty). Best-effort: on any LLM/parse failure returns [] so the
-    audit never blocks a sync — it can only ADD safety, never remove output.
+    Run the scope-aware completeness audit. Returns a list of missing-fact dicts
+    (possibly empty), each tagged with a "placement":
+      - "this_article"     → belongs here; drives the revision pass.
+      - "existing_article" → belongs in a DIFFERENT existing article (carries a
+                             validated "target_slug"); surfaced as a routing hint.
+      - "new_article"      → warrants its own NEW article (carries
+                             "suggested_article"); surfaced as a spin-off hint.
+    Best-effort: on any LLM/parse failure returns [] so the audit never blocks a
+    sync — it can only ADD safety, never remove output.
     """
     if not article_html or not docs_chunks:
         return []
+    roster = other_articles or []
+    valid_slugs = {a.get("slug") for a in roster if a.get("slug")}
     payload = {
+        "article_title": article_title or "",
+        "article_html": article_html,
         "source_chunks": [
             {"chunk_index": c.get("index"), "text": c["text"]}
             for c in docs_chunks
         ],
-        "article_html": article_html,
+        "other_articles": [
+            {"slug": a.get("slug"), "title": a.get("title")}
+            for a in roster
+        ],
     }
     try:
         resp = await router.chat(
@@ -633,7 +691,6 @@ async def _audit_article_completeness(
     if not parsed or "missing" not in parsed:
         return []
     missing = parsed.get("missing") or []
-    # Normalize / guard shape.
     out = []
     for m in missing:
         if not isinstance(m, dict):
@@ -644,9 +701,74 @@ async def _audit_article_completeness(
         sev = str(m.get("severity", "medium")).lower()
         if sev not in ("high", "medium", "low"):
             sev = "medium"
+        placement = str(m.get("placement", "this_article")).lower()
+        if placement not in ("this_article", "existing_article", "new_article"):
+            placement = "this_article"
+        target_slug = str(m.get("target_slug") or "").strip() or None
+        suggested = str(m.get("suggested_article") or "").strip() or None
+
+        # Validate the placement is actionable; downgrade to this_article if not
+        # (so a fact is never silently dropped into a non-existent home).
+        if placement == "existing_article":
+            if not target_slug or target_slug not in valid_slugs:
+                # Claimed an existing home but didn't name a real one.
+                # If it named a plausible new article, treat as new_article;
+                # otherwise keep it here.
+                placement = "new_article" if suggested else "this_article"
+        if placement == "new_article" and not suggested:
+            placement = "this_article"
+
         out.append({"fact": fact, "severity": sev,
-                    "why": str(m.get("why", "")).strip()})
+                    "why": str(m.get("why", "")).strip(),
+                    "placement": placement,
+                    "target_slug": target_slug,
+                    "suggested_article": suggested})
     return out
+
+
+def _group_spinoffs(new_article_facts: list[dict]) -> list[dict]:
+    """
+    Consolidate new_article facts into per-article suggestions. Several missing
+    facts often point at the same proposed article ("Using the Bankr CLI");
+    group them so the reviewer sees one suggestion with its supporting facts.
+    Returns: [{"suggested_article": str, "facts": [...]}, ...] sorted by support.
+    """
+    by_title: dict = {}
+    for m in new_article_facts:
+        title = (m.get("suggested_article") or "").strip()
+        if not title:
+            continue
+        bucket = by_title.setdefault(
+            title.lower(), {"suggested_article": title, "facts": []})
+        bucket["facts"].append({
+            "fact": m.get("fact", ""), "severity": m.get("severity", "medium"),
+            "why": m.get("why", ""),
+        })
+    return sorted(by_title.values(), key=lambda b: len(b["facts"]), reverse=True)
+
+
+def _group_existing_routes(existing_facts: list[dict],
+                           roster_by_slug: dict) -> list[dict]:
+    """
+    Consolidate existing_article facts by the target article they belong in.
+    Returns: [{"target_slug": str, "target_title": str, "facts": [...]}, ...]
+    sorted by support. target_title is resolved from the roster for display.
+    """
+    by_slug: dict = {}
+    for m in existing_facts:
+        slug = (m.get("target_slug") or "").strip()
+        if not slug:
+            continue
+        bucket = by_slug.setdefault(slug, {
+            "target_slug": slug,
+            "target_title": (roster_by_slug.get(slug) or {}).get("title") or slug,
+            "facts": [],
+        })
+        bucket["facts"].append({
+            "fact": m.get("fact", ""), "severity": m.get("severity", "medium"),
+            "why": m.get("why", ""),
+        })
+    return sorted(by_slug.values(), key=lambda b: len(b["facts"]), reverse=True)
 
 
 def _revision_system_prompt() -> str:
@@ -1015,47 +1137,88 @@ async def propose(
 
     # ── Completeness audit (Pass 1.5) ────────────────────────────────────
     # For every article the LLM decided to rewrite, audit the generated body
-    # against the source chunks for dropped caveats/limitations, attempt one
-    # auto-revision to fold gaps back in, and keep any residual gaps to show in
-    # the review UI. Best-effort and bounded; failures never block the sync.
+    # against the source chunks for dropped facts, then route each missing fact
+    # by PLACEMENT:
+    #   - this_article     → fold in via one auto-revision pass.
+    #   - existing_article → don't inline; flag that it belongs in another
+    #                        EXISTING article (a cross-article routing hint).
+    #   - new_article      → don't inline; flag as a spin-off NEW article hint.
+    # Best-effort and bounded; failures never block the sync.
     audit_sem = asyncio.Semaphore(3)
 
+    # Roster of existing articles the audit can route facts to. Built once.
+    _roster = [{"slug": e["slug"], "title": e["title"]} for e in live_entries]
+    _roster_by_slug = {e["slug"]: e for e in live_entries}
+
     async def _audit_and_maybe_revise(entry, chunks, result):
-        """Returns (revised_new_article_or_None, residual_flags)."""
+        """
+        Returns (revised_or_None, residual_flags, new_spinoffs, existing_routes).
+          - residual_flags: this_article facts STILL missing after revision.
+          - new_spinoffs:   facts that want their own NEW article (grouped).
+          - existing_routes: facts that belong in another EXISTING article
+                             (grouped by target slug). Excludes any route that
+                             points back at THIS article.
+        """
         if result.get("decision") != "needs_update":
-            return None, []
+            return None, [], [], []
         new_article = result.get("new_article") or {}
         html = new_article.get("contentHtml")
         if not html:
-            return None, []
+            return None, [], [], []
+        title = str(new_article.get("title") or entry["title"])
+        # Roster excludes the article being audited (can't route to itself).
+        roster = [a for a in _roster if a["slug"] != entry["slug"]]
+
         async with audit_sem:
             missing = await _audit_article_completeness(
-                router, article_html=str(html), docs_chunks=chunks,
+                router, article_title=title, article_html=str(html),
+                docs_chunks=chunks, other_articles=roster,
             )
             if not missing:
-                return None, []
+                return None, [], [], []
+
+            add_here = [m for m in missing if m["placement"] == "this_article"]
+            new_facts = [m for m in missing if m["placement"] == "new_article"]
+            exist_facts = [m for m in missing
+                           if m["placement"] == "existing_article"
+                           and m.get("target_slug") != entry["slug"]]
+            new_spinoffs = _group_spinoffs(new_facts)
+            existing_routes = _group_existing_routes(exist_facts, _roster_by_slug)
+
+            elsewhere = len(new_facts) + len(exist_facts)
+            if not add_here:
+                if elsewhere:
+                    await _emit(
+                        f"Audit: {entry['slug']} — {elsewhere} fact(s) belong "
+                        f"elsewhere, nothing to inline"
+                    )
+                return None, [], new_spinoffs, existing_routes
+
             await _emit(
-                f"Audit: {entry['slug']} missing {len(missing)} documented "
+                f"Audit: {entry['slug']} missing {len(add_here)} in-scope "
                 f"fact(s) — revising"
+                + (f" (+{elsewhere} routed elsewhere)" if elsewhere else "")
             )
             revised = await _revise_article_with_missing(
                 router,
-                title=str(new_article.get("title") or entry["title"]),
+                title=title,
                 description=(str(new_article.get("description"))
                             if new_article.get("description") else None),
                 article_html=str(html),
-                missing=missing,
+                missing=add_here,
                 docs_chunks=chunks,
             )
             if not revised:
-                # Revision failed → keep original body, surface ALL gaps.
-                return None, missing
-            # Re-audit the revised body so the reviewer only sees what's STILL
-            # missing after the fix (usually nothing).
-            residual = await _audit_article_completeness(
-                router, article_html=revised["contentHtml"], docs_chunks=chunks,
+                # Revision failed → keep original body, surface in-scope gaps.
+                return None, add_here, new_spinoffs, existing_routes
+            # Re-audit; only this_article facts count as residual gaps.
+            re_missing = await _audit_article_completeness(
+                router, article_title=revised["title"],
+                article_html=revised["contentHtml"], docs_chunks=chunks,
+                other_articles=roster,
             )
-            return revised, residual
+            residual = [m for m in re_missing if m["placement"] == "this_article"]
+            return revised, residual, new_spinoffs, existing_routes
 
     audit_outcomes = await asyncio.gather(*[
         _audit_and_maybe_revise(entry, chunks, result)
@@ -1063,7 +1226,8 @@ async def propose(
     ])
 
     items: list[ProposalItem] = []
-    for (entry, chunks, result), (revised, residual) in zip(pass1_results, audit_outcomes):
+    for (entry, chunks, result), (revised, residual, new_spinoffs, existing_routes) \
+            in zip(pass1_results, audit_outcomes):
         total_in  += result["tokens_in"]
         total_out += result["tokens_out"]
 
@@ -1094,18 +1258,34 @@ async def propose(
             reason=result.get("reason", ""),
             docs_excerpt=excerpt,
             audit_flags=residual or [],
+            spinoff_suggestions=new_spinoffs or [],
+            existing_routes=existing_routes or [],
         )
         items.append(item)
 
-    # Surface audit residue in the run notes so it's visible even without
+    # Surface audit findings in the run notes so they're visible without
     # opening each row.
-    flagged = [(it.slug, it.audit_flags) for it in items if it.audit_flags]
+    flagged = [it for it in items if it.audit_flags]
     if flagged:
-        total_facts = sum(len(f) for _, f in flagged)
+        total_facts = sum(len(it.audit_flags) for it in flagged)
         notes.append(
             f"Completeness audit: {total_facts} documented fact(s) still missing "
             f"after auto-revision across {len(flagged)} article(s) — see per-row "
             f"audit warnings before publishing."
+        )
+    spinoff_items = [it for it in items if it.spinoff_suggestions]
+    if spinoff_items:
+        n_articles = sum(len(it.spinoff_suggestions) for it in spinoff_items)
+        notes.append(
+            f"Audit suggested {n_articles} NEW article(s) for content that "
+            f"doesn't fit existing articles — see per-row spin-off hints."
+        )
+    route_items = [it for it in items if it.existing_routes]
+    if route_items:
+        n_routes = sum(len(it.existing_routes) for it in route_items)
+        notes.append(
+            f"Audit found facts that belong in {n_routes} other EXISTING "
+            f"article(s) — see per-row routing hints."
         )
 
 
