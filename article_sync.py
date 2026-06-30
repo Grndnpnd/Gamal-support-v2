@@ -76,6 +76,13 @@ class ProposalItem:
     proposed_description: Optional[str] = None
     reason:        str = ""
     docs_excerpt:  Optional[str] = None
+    audit_flags:   list = field(default_factory=list)
+                                # completeness-audit residue: documented facts
+                                # the audit found still missing AFTER the auto-
+                                # revision pass. Each: {fact, severity, why}.
+                                # Surfaced in the review UI as a warning so a
+                                # human can eyeball before publishing. Empty =
+                                # audit found nothing missing (the good case).
 
 # kind values:
 #   "unchanged"     article still reflects the docs — no action needed
@@ -203,7 +210,7 @@ async def _retrieve_union(
     group_name: str,
     current_html: Optional[str] = None,
     per_query_k: int = 8,
-    union_cap: int = 18,
+    union_cap: int = 24,
 ) -> list[dict]:
     """
     Multi-query union retrieval for one article.
@@ -346,8 +353,31 @@ def extract_topical_sections(docs_text: str) -> list[dict]:
 _HOUSE_VOICE = """\
 HOUSE VOICE & STYLE — Bankr help center articles
 
-- Plain language, not developer docs. Write like you're explaining to a
-  smart friend, not a developer reading an API reference.
+COMPLETENESS IS THE #1 RULE. These articles are the first and often ONLY place
+Bankr's support AI looks — it answers from them and stops. An article that omits
+a documented detail causes a wrong or incomplete answer to reach a real user.
+Therefore your job is a LOSSLESS TRANSFORMATION of the source docs into help-
+article form, NOT a summary. Reframe for a support reader, but DROP NOTHING that
+matters.
+
+Non-negotiable: every one of the following that appears in the source excerpts
+MUST appear in the article body —
+  - Limitations and restrictions ("cannot", "only", "not supported", "no longer").
+  - Irreversible or hard-to-reverse actions, and anything fixed/locked at a point
+    in time ("fixed at launch", "can't be reassigned", "permanent").
+  - Anything that affects money, ownership, access, or eligibility (who can/can't
+    claim, what transfers and what does NOT transfer, fees, cliffs, vesting,
+    spending limits, daily caps).
+  - Conditions, prerequisites, and gotchas ("you must have X first", "requires
+    ETH for gas", "only the beneficiary wallet can…").
+  - Exceptions and special cases ("Partner/org launches do NOT include…").
+Omitting any such caveat is a DEFECT, not a stylistic choice. When in doubt,
+include it. It is far better to be thorough than tidy.
+
+STYLE (apply on top of completeness, never at its expense):
+- Plain language, not developer docs. Explain like you're talking to a smart
+  friend, not someone reading an API reference — but a thorough friend who warns
+  you about the sharp edges.
 - Title is a real user question: "How Do I Place a Trade?" not "Trading
   Documentation."
 - The title goes in the JSON "title" field, NEVER inside the contentHtml.
@@ -356,10 +386,15 @@ HOUSE VOICE & STYLE — Bankr help center articles
   duplicate heading on the published page. Start the body with the first
   real content paragraph (a <p>) or an intro <h2> for a subsection.
 - Practical numbered steps the user can follow.
+- Surface important caveats visibly — give limitations and "cannot/does not"
+  facts their own clear sentence or a dedicated "Important Limitations" /
+  "Things to know" section, rather than burying them mid-paragraph.
 - Include example prompts the user can copy/paste into Bankr where useful.
 - Link to docs.bankr.bot at the end for technical deep-dives.
 - Common troubleshooting tips where relevant.
-- Code examples minimal — only when truly necessary.
+- Code examples minimal — only when truly necessary (a user-facing CLI command
+  is fine; an internal contract call should be described in plain terms with a
+  pointer to the docs, not omitted).
 - Tone: friendly, direct, confident — like a knowledgeable friend. Not
   corporate, not overly casual.
 - Output HTML, not markdown. Use simple, semantic HTML: <p>, <ol>, <ul>,
@@ -512,8 +547,177 @@ Respond ONLY with a single JSON object. No preamble, no markdown fence:
 """
 
 
+# ─── Completeness audit (catches summarization drops) ────────────────────────
+#
+# Even with strong retrieval and a completeness-first prompt, an LLM rewriting
+# docs into an article will sometimes drop a caveat it judged less important —
+# and the dropped ones are disproportionately the dangerous edge cases (e.g.
+# "the vested allocation can't be reassigned"). Because Plain's AI answers from
+# these articles and stops, a dropped caveat is a wrong answer shipped to a user.
+#
+# The audit is a focused second LLM pass: given the SOURCE chunks and the
+# GENERATED article, list every documented caveat / limitation / restriction /
+# money-or-access-affecting fact that is present in the chunks but ABSENT from
+# the article. If gaps are found we attempt ONE auto-revision that folds them
+# in; any gaps still missing after revision are attached to the proposal item
+# so a human sees them in the review UI before publishing.
+
+def _audit_system_prompt() -> str:
+    return """You are auditing a drafted Bankr help center article for COMPLETENESS against the source documentation excerpts it was written from.
+
+You will receive:
+- "source_chunks": the documentation excerpts the article should faithfully cover.
+- "article_html": the drafted article body.
+
+Find every fact in source_chunks that a support reader would need but that is
+MISSING from article_html. Focus hard on the high-stakes kinds of facts:
+- Limitations / restrictions ("cannot", "only", "not supported", "no longer").
+- Irreversible or locked-at-a-point-in-time facts ("fixed at launch", "can't be
+  reassigned", "permanent").
+- Anything affecting money, ownership, access, or eligibility (who can/can't do
+  something, what transfers and what does NOT, fees, cliffs, vesting, caps).
+- Prerequisites and gotchas; exceptions and special cases.
+
+Do NOT report:
+- Stylistic differences, wording, ordering, or formatting.
+- Developer/API minutiae that genuinely doesn't belong in a user help article
+  (raw endpoint schemas, internal contract ABIs) UNLESS the user-facing
+  consequence is missing (the consequence must be stated even if the mechanism
+  isn't).
+- Facts already present in the article, even if phrased differently.
+
+Respond ONLY with a single JSON object, no preamble, no markdown fence:
+{
+  "missing": [
+    {
+      "fact": "Short statement of the missing fact, in plain language.",
+      "severity": "high" | "medium" | "low",
+      "why": "One short clause on why a user needs this."
+    }
+  ]
+}
+If nothing material is missing, return {"missing": []}."""
+
+
+async def _audit_article_completeness(
+    router: "LLMRouter",
+    *,
+    article_html: str,
+    docs_chunks: list[dict],
+) -> list[dict]:
+    """
+    Run the completeness audit. Returns a list of missing-fact dicts
+    (possibly empty). Best-effort: on any LLM/parse failure returns [] so the
+    audit never blocks a sync — it can only ADD safety, never remove output.
+    """
+    if not article_html or not docs_chunks:
+        return []
+    payload = {
+        "source_chunks": [
+            {"chunk_index": c.get("index"), "text": c["text"]}
+            for c in docs_chunks
+        ],
+        "article_html": article_html,
+    }
+    try:
+        resp = await router.chat(
+            messages=[{"role": "user",
+                       "content": json.dumps(payload, ensure_ascii=False)}],
+            system=_audit_system_prompt(),
+            temperature=0.0,
+        )
+    except Exception:
+        log.exception("_audit_article_completeness: LLM call failed")
+        return []
+    parsed = _extract_json_object(str(resp))
+    if not parsed or "missing" not in parsed:
+        return []
+    missing = parsed.get("missing") or []
+    # Normalize / guard shape.
+    out = []
+    for m in missing:
+        if not isinstance(m, dict):
+            continue
+        fact = str(m.get("fact", "")).strip()
+        if not fact:
+            continue
+        sev = str(m.get("severity", "medium")).lower()
+        if sev not in ("high", "medium", "low"):
+            sev = "medium"
+        out.append({"fact": fact, "severity": sev,
+                    "why": str(m.get("why", "")).strip()})
+    return out
+
+
+def _revision_system_prompt() -> str:
+    return f"""You are REVISING a Bankr help center article to fold in documented facts that an audit found MISSING. Keep everything already correct in the article; ADD the missing facts in the right places, surfaced clearly (a dedicated limitation/caveat belongs in a visible sentence or an "Important Limitations" / "Things to know" section, not buried).
+
+You will receive:
+- "article_html": the current article body.
+- "missing_facts": the facts to incorporate.
+- "source_chunks": the source docs, for accurate wording of the added facts.
+
+Produce the full revised article. Do not drop anything that was already there.
+
+{_HOUSE_VOICE}
+
+Respond ONLY with a single JSON object, no preamble, no markdown fence:
+{{
+  "title":       "How Do I ...?",
+  "description": "One-sentence summary for search.",
+  "contentHtml": "<p>...</p>..."
+}}"""
+
+
+async def _revise_article_with_missing(
+    router: "LLMRouter",
+    *,
+    title: str,
+    description: Optional[str],
+    article_html: str,
+    missing: list[dict],
+    docs_chunks: list[dict],
+) -> Optional[dict]:
+    """
+    One auto-revision pass that folds missing facts into the article. Returns a
+    new_article dict {title, description, contentHtml} or None on failure (caller
+    keeps the pre-revision article and surfaces the gaps in the review UI).
+    """
+    if not missing:
+        return None
+    payload = {
+        "article_html": article_html,
+        "missing_facts": missing,
+        "source_chunks": [
+            {"chunk_index": c.get("index"), "text": c["text"]}
+            for c in docs_chunks
+        ],
+        "current_title": title,
+        "current_description": description or "",
+    }
+    try:
+        resp = await router.chat(
+            messages=[{"role": "user",
+                       "content": json.dumps(payload, ensure_ascii=False)}],
+            system=_revision_system_prompt(),
+            temperature=0.1,
+        )
+    except Exception:
+        log.exception("_revise_article_with_missing: LLM call failed")
+        return None
+    parsed = _extract_json_object(str(resp))
+    if not parsed or not parsed.get("contentHtml"):
+        return None
+    return {
+        "title":       str(parsed.get("title") or title),
+        "description": (str(parsed.get("description"))
+                        if parsed.get("description") else description),
+        "contentHtml": str(parsed["contentHtml"]),
+    }
+
+
 async def _judge_one_article(
-    router: LLMRouter,
+    router: "LLMRouter",
     article_entry: dict,
     current_plain: Optional[dict],
     docs_chunks: list[dict],
@@ -809,8 +1013,57 @@ async def propose(
 
     pass1_results = await asyncio.gather(*[_bounded(e) for e in live_entries])
 
+    # ── Completeness audit (Pass 1.5) ────────────────────────────────────
+    # For every article the LLM decided to rewrite, audit the generated body
+    # against the source chunks for dropped caveats/limitations, attempt one
+    # auto-revision to fold gaps back in, and keep any residual gaps to show in
+    # the review UI. Best-effort and bounded; failures never block the sync.
+    audit_sem = asyncio.Semaphore(3)
+
+    async def _audit_and_maybe_revise(entry, chunks, result):
+        """Returns (revised_new_article_or_None, residual_flags)."""
+        if result.get("decision") != "needs_update":
+            return None, []
+        new_article = result.get("new_article") or {}
+        html = new_article.get("contentHtml")
+        if not html:
+            return None, []
+        async with audit_sem:
+            missing = await _audit_article_completeness(
+                router, article_html=str(html), docs_chunks=chunks,
+            )
+            if not missing:
+                return None, []
+            await _emit(
+                f"Audit: {entry['slug']} missing {len(missing)} documented "
+                f"fact(s) — revising"
+            )
+            revised = await _revise_article_with_missing(
+                router,
+                title=str(new_article.get("title") or entry["title"]),
+                description=(str(new_article.get("description"))
+                            if new_article.get("description") else None),
+                article_html=str(html),
+                missing=missing,
+                docs_chunks=chunks,
+            )
+            if not revised:
+                # Revision failed → keep original body, surface ALL gaps.
+                return None, missing
+            # Re-audit the revised body so the reviewer only sees what's STILL
+            # missing after the fix (usually nothing).
+            residual = await _audit_article_completeness(
+                router, article_html=revised["contentHtml"], docs_chunks=chunks,
+            )
+            return revised, residual
+
+    audit_outcomes = await asyncio.gather(*[
+        _audit_and_maybe_revise(entry, chunks, result)
+        for entry, chunks, result in pass1_results
+    ])
+
     items: list[ProposalItem] = []
-    for entry, chunks, result in pass1_results:
+    for (entry, chunks, result), (revised, residual) in zip(pass1_results, audit_outcomes):
         total_in  += result["tokens_in"]
         total_out += result["tokens_out"]
 
@@ -820,6 +1073,9 @@ async def propose(
 
         decision = result["decision"]
         new_article = result.get("new_article") or {}
+        # If the audit produced a revised (more complete) article, prefer it.
+        if revised:
+            new_article = revised
         raw_html = new_article.get("contentHtml")
 
         item = ProposalItem(
@@ -837,8 +1093,21 @@ async def propose(
             proposed_description=str(new_article.get("description")) if new_article.get("description") else None,
             reason=result.get("reason", ""),
             docs_excerpt=excerpt,
+            audit_flags=residual or [],
         )
         items.append(item)
+
+    # Surface audit residue in the run notes so it's visible even without
+    # opening each row.
+    flagged = [(it.slug, it.audit_flags) for it in items if it.audit_flags]
+    if flagged:
+        total_facts = sum(len(f) for _, f in flagged)
+        notes.append(
+            f"Completeness audit: {total_facts} documented fact(s) still missing "
+            f"after auto-revision across {len(flagged)} article(s) — see per-row "
+            f"audit warnings before publishing."
+        )
+
 
     # ── PASS 2: Gap detection ────────────────────────────────────────────
     log.info("Pass 2: scanning docs for topics not covered by existing articles...")

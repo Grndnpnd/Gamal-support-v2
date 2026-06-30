@@ -2142,6 +2142,44 @@ def _render_update_card(item: dict, edit: Optional[dict], pins: dict, proposal_i
     plain_id      = item.get("plain_id") or ""
     current_html  = item.get("current_html") or ""
 
+    # Completeness-audit residue: documented facts still missing after the
+    # auto-revision pass. Surface a prominent badge + an expandable warning so
+    # a reviewer can't publish an incomplete article without seeing it.
+    audit_flags   = item.get("audit_flags") or []
+    audit_badge   = ""
+    audit_block   = ""
+    if audit_flags:
+        n_high = sum(1 for f in audit_flags
+                     if (f.get("severity") or "").lower() == "high")
+        sev_word = f"{n_high} high-severity" if n_high else f"{len(audit_flags)}"
+        audit_badge = (
+            f'<span class="badge badge-warn" '
+            f'title="Audit found documented facts missing from this draft">'
+            f'⚠️ {len(audit_flags)} gap(s)</span>'
+        )
+        rows = "".join(
+            f'<li><strong>[{_esc((f.get("severity") or "medium").upper())}]</strong> '
+            f'{_esc(f.get("fact") or "")}'
+            + (f' <span class="dim">— {_esc(f.get("why") or "")}</span>'
+               if f.get("why") else "")
+            + '</li>'
+            for f in audit_flags
+        )
+        audit_block = (
+            '<div class="audit-warning" '
+            'style="margin:8px 0; padding:10px 12px; border-left:3px solid '
+            'var(--warn,#ff673c); background:rgba(255,103,60,0.08); '
+            'border-radius:4px;">'
+            f'<div style="font-weight:600; margin-bottom:4px;">'
+            f'⚠️ Completeness audit: {sev_word} documented fact(s) still missing '
+            f'after auto-revision</div>'
+            '<div class="dim" style="font-size:12px; margin-bottom:6px;">'
+            'These are in the docs but appear to be absent from the draft below. '
+            'Review before publishing.</div>'
+            f'<ul style="margin:0; padding-left:18px; font-size:13px;">{rows}</ul>'
+            '</div>'
+        )
+
     pin_badge = ""
     if is_pinned:
         pin_badge = (
@@ -2172,7 +2210,7 @@ def _render_update_card(item: dict, edit: Optional[dict], pins: dict, proposal_i
           </div>
         </div>
         <div class="async-card-summary-controls" onclick="event.stopPropagation();">
-          {pin_badge}{edited_badge}
+          {pin_badge}{edited_badge}{audit_badge}
           <label{publish_label_dim} class="async-publish-lbl">
             <input type="checkbox" name="publish_slugs" value="{_esc(slug)}"
                    form="bulk-publish-form" {publish_disabled}>
@@ -2186,6 +2224,7 @@ def _render_update_card(item: dict, edit: Optional[dict], pins: dict, proposal_i
       </summary>
 
       <div class="async-card-body">
+        {audit_block}
         <div class="dim" style="font-size:12px; margin-bottom:8px;">
           <code>{_esc(slug)}</code>
           {f' · Plain ID: <code>{_esc(plain_id)}</code>' if plain_id else ''}
