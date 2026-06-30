@@ -141,6 +141,135 @@ def _html_to_text_excerpt(html: str, max_chars: int = 800) -> str:
     return text
 
 
+# ─── Multi-query union retrieval (Pass 1 recall) ─────────────────────────────
+#
+# The original Pass 1 retrieved chunks with ONE query: "<title> (<group>)".
+# That anchors retrieval on the article's identity, which is great for
+# "is this article's existing content still accurate" but blind to NEW
+# subtopics the docs grew that this article SHOULD now cover. Concrete
+# failure that motivated this: docs added a "creator vesting" section to
+# token launching; the query "Launching a Token (Token Launching)" never
+# surfaced the vesting chunks in its top-k, so the rewrite couldn't include
+# what it never saw. Because the help-center articles are the authoritative
+# layer Plain's AI reads first (and stops at), a recall miss here silently
+# propagates a stale answer all the way to the user.
+#
+# Fix: retrieve with SEVERAL queries and union the results, deduped by chunk
+# index. The query set casts a wider net:
+#   1. title + group          — article identity (original behavior)
+#   2. each section heading    — catches "an existing section went stale"
+#      pulled from current_html
+#   3. a broad subject query   — catches "an adjacent new subtopic appeared"
+#      (title + group + generic facet terms)
+# The union is sorted by best distance and capped so prompt cost stays bounded.
+
+# Block-level HTML heading tags we emit in article bodies.
+_ARTICLE_HEADING_RE = re.compile(
+    r"<h[1-3][^>]*>(.*?)</h[1-3]>", re.IGNORECASE | re.DOTALL
+)
+
+
+def _extract_article_headings(html: str, max_headings: int = 8) -> list[str]:
+    """
+    Pull section heading texts out of an article's HTML body so each can seed
+    its own retrieval query. Returns cleaned, deduped heading strings (order
+    preserved), capped at max_headings to bound the number of queries.
+    """
+    if not html:
+        return []
+    out: list[str] = []
+    seen: set[str] = set()
+    for m in _ARTICLE_HEADING_RE.finditer(html):
+        # Strip any nested tags inside the heading, collapse whitespace.
+        raw = re.sub(r"<[^>]+>", "", m.group(1))
+        raw = re.sub(r"\s+", " ", raw).strip()
+        # Skip empties and trivially short headings (e.g. a stray "&nbsp;").
+        if len(raw) < 3:
+            continue
+        key = raw.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(raw)
+        if len(out) >= max_headings:
+            break
+    return out
+
+
+async def _retrieve_union(
+    docs_manager,
+    *,
+    title: str,
+    group_name: str,
+    current_html: Optional[str] = None,
+    per_query_k: int = 8,
+    union_cap: int = 18,
+) -> list[dict]:
+    """
+    Multi-query union retrieval for one article.
+
+    Runs several semantically-distinct queries through docs_manager and unions
+    the returned chunks, deduped by chunk index, sorted by best (lowest)
+    distance, capped at union_cap.
+
+    Queries issued:
+      - "<title> (<group>)"                       — article identity
+      - each section heading in current_html      — existing-section freshness
+      - "<title> <group> overview details fees    — broad facet expansion that
+         limits options requirements"                surfaces adjacent subtopics
+                                                      not yet in the article
+
+    Returns the same chunk dict shape as query_chunks: {text, distance, index}.
+    Falls back gracefully — any individual query that errors or returns nothing
+    just contributes no chunks; the union is best-effort.
+    """
+    queries: list[str] = [f"{title} ({group_name})"]
+
+    for heading in _extract_article_headings(current_html or ""):
+        # Pair the heading with the article title so retrieval stays in-domain
+        # ("Fees" alone is ambiguous across the docs; "Fees Launching a Token"
+        # disambiguates toward the right chunks).
+        queries.append(f"{heading} {title}")
+
+    # Broad facet expansion — the catch-all that surfaces brand-new subtopics
+    # the article doesn't mention yet. Generic facet terms ("fees", "limits",
+    # "requirements", etc.) bias retrieval toward the kinds of details support
+    # articles need to stay complete, without naming any specific subtopic.
+    queries.append(
+        f"{title} {group_name} overview details fees limits "
+        f"requirements options eligibility configuration"
+    )
+
+    # Issue all queries, union by chunk index keeping the best distance seen.
+    best_by_index: dict = {}
+    for q in queries:
+        try:
+            chunks = await docs_manager.query_chunks(q, top_k=per_query_k)
+        except Exception:
+            log.exception(f"_retrieve_union: query_chunks failed for {q!r}")
+            continue
+        for c in chunks or []:
+            idx = c.get("index")
+            # Chunks without a stable index can't be deduped reliably; key them
+            # on their text instead so we still don't double-feed identical text.
+            key = idx if idx is not None else ("txt:" + (c.get("text") or "")[:64])
+            dist = c.get("distance")
+            prev = best_by_index.get(key)
+            if prev is None or (
+                dist is not None
+                and prev.get("distance") is not None
+                and dist < prev["distance"]
+            ):
+                best_by_index[key] = c
+
+    # Sort by distance ascending (None distances sink to the end), cap.
+    unioned = sorted(
+        best_by_index.values(),
+        key=lambda c: (c.get("distance") is None, c.get("distance") or 0.0),
+    )
+    return unioned[:union_cap]
+
+
 # ─── Header parser (Pass 2 input prep) ───────────────────────────────────────
 #
 # We deliberately only look at H1 and H2 because the docs are inconsistent
@@ -332,24 +461,41 @@ def _pass1_system_prompt() -> str:
 
 You will receive:
 - The article's current title, slug, category, and HTML body.
-- The 6-8 documentation excerpts that were retrieved as the most semantically
-  relevant to this article's topic.
+- A set of documentation excerpts retrieved as most relevant to this article's
+  topic. These are gathered by MULTIPLE queries (the article's title, each of
+  its section headings, and a broad subject sweep), so the set may include
+  excerpts about subtopics the article does NOT yet mention. That is
+  intentional — part of your job is spotting documented subtopics the article
+  is missing.
+
+These help center articles are the FIRST place Bankr's support AI looks, and it
+stops once it finds an answer here — so an article that omits a documented
+detail causes the support AI to give an incomplete answer. Completeness matters
+as much as accuracy.
 
 Decide which one of these applies to this article:
-- "unchanged"    — the current article still accurately reflects the docs.
-                   Pick this if differences are cosmetic (whitespace, ordering,
-                   small wording) — only flag substantive content drift.
-- "needs_update" — the docs cover this topic but the article is missing
-                   information, has outdated information, or could be
-                   meaningfully better. Be honest but conservative — false
-                   positives waste reviewer time.
+- "unchanged"    — the current article still accurately AND completely reflects
+                   the docs. Pick this only if there is no substantive content
+                   drift and no documented subtopic is missing. Cosmetic
+                   differences (whitespace, ordering, small wording) do not
+                   count — ignore them.
+- "needs_update" — the article is missing information that the docs cover, has
+                   outdated information, or could be meaningfully more complete.
+                   A documented subtopic present in the excerpts but absent from
+                   the article body is a needs_update (e.g. the docs describe a
+                   fee/vesting/limit/eligibility detail the article never
+                   mentions). Be honest but conservative about cosmetic noise —
+                   but treat genuinely missing documented content as a real
+                   miss, not a nitpick.
 - "orphan"       — the retrieved docs are weak matches (the article's topic
                    isn't really documented anymore, OR the article is about
                    something Bankr no longer does). The reviewer will look at
                    this manually.
 
 If you pick "needs_update", ALSO produce the full new article: a title (real
-user question), a one-sentence description for search, and the HTML body.
+user question), a one-sentence description for search, and the HTML body. The
+new body must fold in every documented detail from the excerpts that belongs in
+this article — don't just patch the one thing you noticed; make it complete.
 
 {_HOUSE_VOICE}
 
@@ -623,16 +769,26 @@ async def propose(
 
     async def _judge_with_chunks(entry):
         nonlocal pass1_done
-        # Build a search query that semantically retrieves docs relevant to
-        # this article: title + category usually gets richer results than
-        # title alone because category disambiguates ("how do I trade" vs
-        # "how do I trade on Polymarket").
-        query = f"{entry['title']} ({entry['group_name']})"
-        chunks = await docs_manager.query_chunks(query, top_k=docs_top_k)
+        # Multi-query union retrieval (see _retrieve_union). The old single
+        # "<title> (<group>)" query anchored on article identity and missed
+        # NEW subtopics the docs grew (e.g. creator vesting added under token
+        # launching never surfaced for the query "Launching a Token"). Because
+        # these articles are the authoritative layer Plain's AI reads first,
+        # a recall miss here silently ships a stale answer. The union widens
+        # retrieval across the title, each existing section heading, and a
+        # broad facet expansion so adjacent new subtopics get pulled in too.
+        current_plain = plain_by_slug.get(entry["slug"])
+        chunks = await _retrieve_union(
+            docs_manager,
+            title=entry["title"],
+            group_name=entry["group_name"],
+            current_html=(current_plain or {}).get("contentHtml"),
+            per_query_k=docs_top_k,
+        )
         result = await _judge_one_article(
             router,
             entry,
-            plain_by_slug.get(entry["slug"]),
+            current_plain,
             chunks,
         )
         async with pass1_lock:
