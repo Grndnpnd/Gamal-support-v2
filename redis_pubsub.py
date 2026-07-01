@@ -105,6 +105,52 @@ async def request_reindex(triggered_by: str = "admin") -> bool:
         return False
 
 
+async def heal_stale_reindex_status(service: str) -> bool:
+    """
+    Startup self-heal for orphaned reindex status.
+
+    request_reindex() pre-marks every service 'running' when the button is
+    pressed. Each service is then supposed to write 'done'/'failed' when it
+    finishes. If a service CRASHES mid-reindex (or its listener task dies), it
+    never writes a terminal state, so reindex:status:{service} stays 'running'
+    for the full 7-day TTL — which leaves the admin button disabled ("stuck
+    pressed"), because the panel sees a service still in progress.
+
+    A freshly-booted process cannot be in the middle of a reindex that started
+    before it existed. So on startup: if THIS service's status is 'running',
+    it is necessarily stale — clear it to 'failed' with an explanatory detail.
+    This un-sticks the button on deploy and prevents the wedge from recurring.
+
+    Returns True if a stale 'running' was cleared, else False.
+    """
+    r = _get_redis()
+    if r is None:
+        return False
+    try:
+        raw = await r.get(f"{STATUS_KEY_PREFIX}{service}")
+        if not raw:
+            return False
+        try:
+            cur = json.loads(raw)
+        except json.JSONDecodeError:
+            return False
+        if cur.get("state") == "running":
+            await set_reindex_status(
+                service, "failed",
+                detail="stale 'running' cleared on startup (previous reindex "
+                       "never completed — likely crashed mid-run)",
+            )
+            log.warning(
+                f"heal_stale_reindex_status: cleared orphaned 'running' status "
+                f"for {service} (was stuck since {cur.get('at')})"
+            )
+            return True
+        return False
+    except Exception as e:
+        log.error(f"heal_stale_reindex_status failed for {service}: {e}")
+        return False
+
+
 # ─── Status ───────────────────────────────────────────────────────────────────
 
 async def set_reindex_status(service: str, state: str, detail: str = "") -> None:

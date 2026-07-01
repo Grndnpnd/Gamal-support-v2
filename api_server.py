@@ -42,7 +42,7 @@ from shared import SemanticDocsManager, OllamaClient
 from llm_router import LLMRouter
 from plain_client import PlainClient
 from redis_pubsub import (
-    listen_for_reindex, set_reindex_status,
+    listen_for_reindex, set_reindex_status, heal_stale_reindex_status,
     listen_for_article_sync, set_article_sync_status,
     save_article_sync_proposal,
 )
@@ -95,6 +95,8 @@ async def lifespan(app: FastAPI):
             log.error(f"API reindex failed: {e}")
             await set_reindex_status("api", "failed", detail=str(e)[:120])
 
+    # Self-heal a stale 'running' status left by a crashed prior reindex.
+    await heal_stale_reindex_status("api")
     reindex_task = asyncio.ensure_future(listen_for_reindex(_on_reindex_signal))
 
     # Listen for manual help-center article-sync signals from the admin panel.

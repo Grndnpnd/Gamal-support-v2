@@ -33,7 +33,7 @@ from redis_map import (
 )
 from redis_overrides import find_matching_override, record_override_hit
 from redis_settings import get_settings
-from redis_pubsub import listen_for_reindex, set_reindex_status
+from redis_pubsub import listen_for_reindex, set_reindex_status, heal_stale_reindex_status
 import db
 
 load_dotenv()
@@ -634,6 +634,9 @@ class BankrSupportBot(discord.Client):
 
         await self.docs.ensure_ready()
         asyncio.ensure_future(self._cleanup_loop())
+        # Self-heal: if a previous run crashed mid-reindex, its status is stuck
+        # at 'running' and the admin button stays disabled. Clear it on boot.
+        await heal_stale_reindex_status("bot")
         # Listen for manual docs re-index signals from the admin panel.
         asyncio.ensure_future(listen_for_reindex(self._on_reindex_signal))
 
