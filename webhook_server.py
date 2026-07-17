@@ -394,10 +394,23 @@ def _verify_plain_signature(raw_body: bytes, signature_header: str | None) -> bo
 
 async def handle_plain_webhook(request: web.Request) -> web.Response:
     """
-    Handle incoming Plain webhook events.
-    Only relays messages from human agents (actorType: user).
-    Skips customer and machineUser events to prevent echo loops.
-    Uses event ID deduplication to prevent duplicate posts on Plain retries.
+    Thin acknowledgement handler for Plain webhooks.
+
+    Plain guarantees AT-LEAST-ONCE delivery: if we don't return a 2xx quickly,
+    Plain retries on a backoff schedule (10s, 30s, 5m, 30m, 1h, 3h, ... up to
+    4 days). Doing the relay work (Discord API calls, Redis round-trips) inline
+    BEFORE returning meant a slow or failed handler never 2xx'd in time, which
+    kicked off that retry chain — the source of the ~30-minute "duplicate"
+    replies we were papering over with a content deduper (confirmed by Plain's
+    engineers 2026-07-17).
+
+    Fix: validate the request (signature + JSON) synchronously, then ACK with
+    200 IMMEDIATELY and hand all processing to a background task. Plain sees a
+    fast 2xx every time, so it never retries on our latency. At-least-once
+    delivery + the existing event-id/content dedupe keep processing idempotent
+    if the process dies between ack and completion (Plain re-delivers, we catch
+    it). The event-id claim deliberately lives in the background task, NOT here,
+    so an ack-then-crash lets a retry re-process rather than being suppressed.
     """
     # Read the raw body bytes first — needed for HMAC signature verification.
     # Calling request.json() would consume the body and we'd lose the raw form.
@@ -422,199 +435,228 @@ async def handle_plain_webhook(request: web.Request) -> web.Response:
     event_id   = body.get("id", "")
     log.info(f"Plain webhook received: {event_type} (id={event_id})")
 
-    # Deduplication — Plain retries webhooks if it doesn't get a timely 200,
-    # and retries survive service redeploys. Redis-backed; see _already_relayed.
-    if event_id and await _already_relayed(event_id):
-        log.info(f"Duplicate event {event_id} — already relayed, skipping")
-        return web.Response(status=200, text="OK")
+    # Hand off ALL processing to a background task and ack immediately. Any
+    # error inside processing is logged there, never surfaced to Plain — a
+    # processing failure must not turn into a non-2xx that triggers retries.
+    asyncio.ensure_future(_process_webhook_event(body, event_type, event_id))
+    return web.Response(status=200, text="OK")
 
-    # Events we care about:
-    #   thread.chat_sent       — agent sent a chat message in Plain
-    #   thread.email_sent      — agent sent an email reply in Plain
-    #   thread.thread_status_transitioned — ticket resolved/done
-    if event_type not in (
-        "thread.chat_sent",
-        "thread.email_sent",
-        "thread.thread_status_transitioned",
-    ):
-        return web.Response(status=200, text="OK")
 
-    payload = body.get("payload", {})
-    thread_id = payload.get("thread", {}).get("id")
+async def _process_webhook_event(body: dict, event_type: str, event_id: str) -> None:
+    """
+    Do the actual relay work for a Plain webhook, off the request path.
 
-    if not thread_id:
-        log.warning(f"Webhook payload missing thread ID. Full payload: {payload}")
-        return web.Response(status=200, text="OK")
+    Runs after handle_plain_webhook has already returned 200 to Plain. All the
+    original branch logic lives here unchanged; the only structural difference
+    is that "return 200" become plain "return" (we've already acked) and the
+    whole body is wrapped so no exception escapes (an escaped exception here
+    would just be an unhandled task error — it can't affect Plain's retry
+    behavior since the ack already happened, but we log it for visibility).
+    """
+    try:
+        # Deduplication — Plain retries webhooks if it doesn't get a timely 200,
+        # and retries survive redeploys. Redis-backed; see _already_relayed.
+        if event_id and await _already_relayed(event_id):
+            log.info(f"Duplicate event {event_id} — already relayed, skipping")
+            return
 
-    # ── Handle status transition (ticket resolved) ────────────────────────────
-    if event_type == "thread.thread_status_transitioned":
-        new_status = payload.get("nextStatus", "") or payload.get("status", "")
-        if new_status.upper() in ("DONE", "RESOLVED"):
-            discord_thread_id = await get_discord_thread_id(thread_id)
-            if discord_thread_id:
-                # Clean up the active-ticket Redis hashes before deleting the
-                # Discord thread. This used to happen ONLY when the user typed
-                # !close in Discord (bot.py owns that path and calls
-                # close_ticket → delete_active_ticket). The Plain-side resolve
-                # path was deleting the Discord thread but leaving the
-                # user_tickets / active_tickets / ticket_customers hashes
-                # populated forever, so when the same user came back later the
-                # bot's user_has_open_ticket() returned a dead thread ID and
-                # tried to forward to <#deleted>, rendering as ⁠unknown in
-                # Discord. Fixed 2026-06-10 — clean state on this path too.
-                #
-                # We look up the user_id from the user_tickets hash (inverse
-                # of the normal lookup) because the webhook only knows the
-                # Plain thread id and the Discord thread id, not which user
-                # owns the ticket.
-                user_id = await get_user_for_thread(int(discord_thread_id))
-                if user_id is not None:
-                    await delete_active_ticket(int(discord_thread_id), user_id)
-                    log.info(
-                        f"Cleaned active-ticket state for resolved Plain thread "
-                        f"{thread_id} (user={user_id}, discord_thread={discord_thread_id})"
+        # Events we care about:
+        #   thread.chat_sent       — agent sent a chat message in Plain
+        #   thread.email_sent      — agent sent an email reply in Plain
+        #   thread.thread_status_transitioned — ticket resolved/done
+        if event_type not in (
+            "thread.chat_sent",
+            "thread.email_sent",
+            "thread.thread_status_transitioned",
+        ):
+            return
+
+        payload = body.get("payload", {})
+        thread_id = payload.get("thread", {}).get("id")
+
+        if not thread_id:
+            log.warning(f"Webhook payload missing thread ID. Full payload: {payload}")
+            return
+
+        # ── Handle status transition (ticket resolved) ────────────────────────
+        if event_type == "thread.thread_status_transitioned":
+            new_status = payload.get("nextStatus", "") or payload.get("status", "")
+            if new_status.upper() in ("DONE", "RESOLVED"):
+                discord_thread_id = await get_discord_thread_id(thread_id)
+                if discord_thread_id:
+                    # Clean up the active-ticket Redis hashes before deleting the
+                    # Discord thread. This used to happen ONLY when the user typed
+                    # !close in Discord (bot.py owns that path and calls
+                    # close_ticket → delete_active_ticket). The Plain-side resolve
+                    # path was deleting the Discord thread but leaving the
+                    # user_tickets / active_tickets / ticket_customers hashes
+                    # populated forever, so when the same user came back later the
+                    # bot's user_has_open_ticket() returned a dead thread ID and
+                    # tried to forward to <#deleted>, rendering as ⁠unknown in
+                    # Discord. Fixed 2026-06-10 — clean state on this path too.
+                    #
+                    # We look up the user_id from the user_tickets hash (inverse
+                    # of the normal lookup) because the webhook only knows the
+                    # Plain thread id and the Discord thread id, not which user
+                    # owns the ticket.
+                    user_id = await get_user_for_thread(int(discord_thread_id))
+                    if user_id is not None:
+                        await delete_active_ticket(int(discord_thread_id), user_id)
+                        log.info(
+                            f"Cleaned active-ticket state for resolved Plain thread "
+                            f"{thread_id} (user={user_id}, discord_thread={discord_thread_id})"
+                        )
+                    else:
+                        # No user mapping — either already cleaned, or the user
+                        # entry was lost somehow. Log it and continue; the
+                        # Discord thread deletion below still proceeds.
+                        log.warning(
+                            f"Resolved Plain thread {thread_id} → Discord {discord_thread_id} "
+                            f"but no user_tickets entry found; state may already be clean"
+                        )
+                    # Schedule deletion with 10s countdown + !keep cancellation
+                    asyncio.ensure_future(
+                        schedule_thread_deletion(int(discord_thread_id), triggered_by="Plain team")
                     )
+                    log.info(f"Scheduled thread deletion for Plain thread {thread_id} -> Discord {discord_thread_id}")
                 else:
-                    # No user mapping — either already cleaned, or the user
-                    # entry was lost somehow. Log it and continue; the
-                    # Discord thread deletion below still proceeds.
-                    log.warning(
-                        f"Resolved Plain thread {thread_id} → Discord {discord_thread_id} "
-                        f"but no user_tickets entry found; state may already be clean"
-                    )
-                # Schedule deletion with 10s countdown + !keep cancellation
-                asyncio.ensure_future(
-                    schedule_thread_deletion(int(discord_thread_id), triggered_by="Plain team")
-                )
-                log.info(f"Scheduled thread deletion for Plain thread {thread_id} -> Discord {discord_thread_id}")
-            else:
-                log.warning(f"No Discord thread mapped for resolved Plain thread {thread_id}")
-        return web.Response(status=200, text="OK")
+                    log.warning(f"No Discord thread mapped for resolved Plain thread {thread_id}")
+        return
 
-    # ── Handle chat_sent / email_sent ─────────────────────────────────────────
+        # ── Handle chat_sent / email_sent ─────────────────────────────────────────
 
-    # Extract message and actor based on event type
-    # Plain schema: chat events wrap content in payload.chat, email in payload.email
-    if event_type == "thread.chat_sent":
-        chat_obj   = payload.get("chat", {}) or {}
-        message_text = chat_obj.get("text", "")
-        created_by = chat_obj.get("createdBy", {}) or {}
-    else:  # thread.email_sent
-        email_obj  = payload.get("email", {}) or {}
-        message_text = (
-            email_obj.get("textContent")
-            or email_obj.get("text")
-            or ""
-        )
-        created_by = email_obj.get("createdBy", {}) or {}
+        # Extract message and actor based on event type
+        # Plain schema: chat events wrap content in payload.chat, email in payload.email
+        if event_type == "thread.chat_sent":
+            chat_obj   = payload.get("chat", {}) or {}
+            message_text = chat_obj.get("text", "")
+            created_by = chat_obj.get("createdBy", {}) or {}
+        else:  # thread.email_sent
+            email_obj  = payload.get("email", {}) or {}
+            message_text = (
+                email_obj.get("textContent")
+                or email_obj.get("text")
+                or ""
+            )
+            created_by = email_obj.get("createdBy", {}) or {}
 
-    # Skip if no text
-    if not message_text:
-        log.info(f"Webhook event {event_type} has no text content, skipping")
-        return web.Response(status=200, text="OK")
+        # Skip if no text
+        if not message_text:
+            log.info(f"Webhook event {event_type} has no text content, skipping")
+        return
 
-    # Skip messages forwarded by our bot — they are prefixed with [discord-relay]
-    # This prevents echo loops where forwarded messages get relayed back to Discord
-    if message_text.startswith("[discord-relay]"):
-        log.info("Skipping discord-relay prefixed message to prevent echo loop")
-        return web.Response(status=200, text="OK")
+        # Skip messages forwarded by our bot — they are prefixed with [discord-relay]
+        # This prevents echo loops where forwarded messages get relayed back to Discord
+        if message_text.startswith("[discord-relay]"):
+            log.info("Skipping discord-relay prefixed message to prevent echo loop")
+        return
 
-    actor_type = (created_by.get("actorType") or "").lower()
+        actor_type = (created_by.get("actorType") or "").lower()
 
-    # Skip customer events — avoid echoing the user's own messages back
-    if actor_type == "customer":
-        log.info("Skipping customer event to prevent echo loop")
-        return web.Response(status=200, text="OK")
+        # Skip customer events — avoid echoing the user's own messages back
+        if actor_type == "customer":
+            log.info("Skipping customer event to prevent echo loop")
+        return
 
-    # Skip unknown actor types
-    if actor_type not in ("user", "machineuser", "machine_user"):
-        log.info(f"Skipping unknown actor type '{actor_type}'")
-        return web.Response(status=200, text="OK")
+        # Skip unknown actor types
+        if actor_type not in ("user", "machineuser", "machine_user"):
+            log.info(f"Skipping unknown actor type '{actor_type}'")
+        return
 
-    # For machineUser events: only allow email_sent through since that's how
-    # human agent email replies arrive (sent by support email machine user).
-    # All other machineUser events (chat forwarding etc) are skipped.
-    if actor_type in ("machineuser", "machine_user") and event_type != "thread.email_sent":
-        log.info("Skipping non-email machineUser event")
-        return web.Response(status=200, text="OK")
+        # For machineUser events: only allow email_sent through since that's how
+        # human agent email replies arrive (sent by support email machine user).
+        # All other machineUser events (chat forwarding etc) are skipped.
+        if actor_type in ("machineuser", "machine_user") and event_type != "thread.email_sent":
+            log.info("Skipping non-email machineUser event")
+        return
 
-    # Look up the Discord thread
-    discord_thread_id = await get_discord_thread_id(thread_id)
+        # Look up the Discord thread
+        discord_thread_id = await get_discord_thread_id(thread_id)
 
-    if not discord_thread_id:
-        log.warning(f"No Discord thread mapped for Plain thread {thread_id}")
-        return web.Response(status=200, text="OK")
+        if not discord_thread_id:
+            log.warning(f"No Discord thread mapped for Plain thread {thread_id}")
+        return
 
-    # Content-level dedupe — catches the case where Plain emits two distinct
-    # events (different event IDs) with the same logical message. Observed
-    # in production with Plain's AI-agent feature: a single reply produces two
-    # thread.email_sent events with different event IDs. We've observed two
-    # patterns — ~6s apart (fast double-emit) and ~20-22min apart (suspected
-    # inactivity follow-up flow that re-emits the previous reply verbatim).
-    # Event-id dedupe treats them as different events (which they are); this
-    # check catches that they're semantically duplicates.
-    if await _content_already_relayed(thread_id, message_text):
-        log.info(
-            f"Duplicate content for thread {thread_id} within "
-            f"{_CONTENT_DEDUPE_TTL_SECONDS // 60}-minute window — "
-            f"skipping (event {event_id})"
-        )
-        # Still mark the event_id so a Plain retry of THIS specific event
-        # doesn't get re-processed and re-checked.
+        # Content-level dedupe — catches the case where Plain emits two distinct
+        # events (different event IDs) with the same logical message. Observed
+        # in production with Plain's AI-agent feature: a single reply produces two
+        # thread.email_sent events with different event IDs. We've observed two
+        # patterns — ~6s apart (fast double-emit) and ~20-22min apart (suspected
+        # inactivity follow-up flow that re-emits the previous reply verbatim).
+        # Event-id dedupe treats them as different events (which they are); this
+        # check catches that they're semantically duplicates.
+        if await _content_already_relayed(thread_id, message_text):
+            log.info(
+                f"Duplicate content for thread {thread_id} within "
+                f"{_CONTENT_DEDUPE_TTL_SECONDS // 60}-minute window — "
+                f"skipping (event {event_id})"
+            )
+            # Still mark the event_id so a Plain retry of THIS specific event
+            # doesn't get re-processed and re-checked.
+            if event_id:
+                await _mark_relayed(event_id)
+        return
+
+        # Mark as relayed before posting so retries are caught even if posting is
+        # slow. Placed AFTER the thread-mapping check above, so an event that
+        # couldn't be mapped is left unmarked and a later retry can still land.
         if event_id:
             await _mark_relayed(event_id)
-        return web.Response(status=200, text="OK")
+        await _mark_content_relayed(thread_id, message_text)
 
-    # Mark as relayed before posting so retries are caught even if posting is
-    # slow. Placed AFTER the thread-mapping check above, so an event that
-    # couldn't be mapped is left unmarked and a later retry can still land.
-    if event_id:
-        await _mark_relayed(event_id)
-    await _mark_content_relayed(thread_id, message_text)
+        # Resolve agent name from createdBy.user (Plain's structure for user actors)
+        thread_obj = payload.get("thread", {}) or {}
+        assignee   = thread_obj.get("assignee", {}) or {}
 
-    # Resolve agent name from createdBy.user (Plain's structure for user actors)
-    thread_obj = payload.get("thread", {}) or {}
-    assignee   = thread_obj.get("assignee", {}) or {}
+        agent_name = (
+            (created_by.get("user") or {}).get("fullName")
+            or (created_by.get("user") or {}).get("publicName")
+            or created_by.get("fullName")
+            or created_by.get("publicName")
+            or assignee.get("fullName")
+            or assignee.get("publicName")
+            or "Support Agent"
+        )
+        log.debug(f"Relaying {event_type} from {agent_name} (actor={actor_type}) to Discord thread {discord_thread_id}")
 
-    agent_name = (
-        (created_by.get("user") or {}).get("fullName")
-        or (created_by.get("user") or {}).get("publicName")
-        or created_by.get("fullName")
-        or created_by.get("publicName")
-        or assignee.get("fullName")
-        or assignee.get("publicName")
-        or "Support Agent"
-    )
-    log.debug(f"Relaying {event_type} from {agent_name} (actor={actor_type}) to Discord thread {discord_thread_id}")
+        discord_message = (
+            f"**💬 Reply from {agent_name}:**\n"
+            f"{message_text}\n\n"
+            f"_Reply in this thread to respond._"
+        )
 
-    discord_message = (
-        f"**💬 Reply from {agent_name}:**\n"
-        f"{message_text}\n\n"
-        f"_Reply in this thread to respond._"
-    )
+        if len(discord_message) > 1900:
+            discord_message = discord_message[:1900] + "…"
 
-    if len(discord_message) > 1900:
-        discord_message = discord_message[:1900] + "…"
+        asyncio.ensure_future(send_discord_message(int(discord_thread_id), discord_message))
 
-    asyncio.ensure_future(send_discord_message(int(discord_thread_id), discord_message))
+        # Log the agent reply to the transcript so the admin panel shows the full
+        # ticket conversation. kind marks it transcript-only (the stats dashboard
+        # ignores it); session is the ticket, so it groups with the whole case.
+        # response_text is the agent's actual message; question is left null since
+        # this row is an agent turn, not a user question.
+        asyncio.ensure_future(db.log_conversation(
+            source="plain",
+            kind="ticket_agent_msg",
+            username=agent_name,
+            channel_id=str(discord_thread_id),
+            response_source="ticket_message",
+            response_text=message_text,
+            session_id=f"ticket_{discord_thread_id}",
+            plain_thread_id=thread_id,
+        ))
 
-    # Log the agent reply to the transcript so the admin panel shows the full
-    # ticket conversation. kind marks it transcript-only (the stats dashboard
-    # ignores it); session is the ticket, so it groups with the whole case.
-    # response_text is the agent's actual message; question is left null since
-    # this row is an agent turn, not a user question.
-    asyncio.ensure_future(db.log_conversation(
-        source="plain",
-        kind="ticket_agent_msg",
-        username=agent_name,
-        channel_id=str(discord_thread_id),
-        response_source="ticket_message",
-        response_text=message_text,
-        session_id=f"ticket_{discord_thread_id}",
-        plain_thread_id=thread_id,
-    ))
+        return
 
-    return web.Response(status=200, text="OK")
+    except Exception:
+        # We've already 200'd to Plain, so this can't trigger a retry — but a
+        # silent failure here means a dropped relay. Log with the event id so
+        # it's traceable. Plain's at-least-once delivery means a genuinely
+        # transient failure may still be re-delivered later and succeed.
+        log.exception(
+            f"_process_webhook_event failed for event {event_id} "
+            f"(type={event_type}) — relay may have been dropped"
+        )
 
 
 # ─── Server Setup ─────────────────────────────────────────────────────────────
