@@ -53,6 +53,12 @@ DOCS_REFRESH_HOURS    = int(os.getenv("DOCS_REFRESH_HOURS", "12"))
 MONITORED_CHANNEL_IDS = [int(x) for x in os.getenv("MONITORED_CHANNEL_IDS", "").split(",") if x.strip()]
 
 CONVERSATION_TTL_MINUTES = int(os.getenv("CONVERSATION_TTL_MINUTES", "30"))
+# How long we remember having sent someone the polite redirect. If they mention
+# or reply to the bot again inside this window, we treat the persistence itself
+# as support intent and answer instead of re-serving the same canned line.
+# Deliberately longer than CONVERSATION_TTL_MINUTES: the failure we saw had a
+# user come back 25 minutes after a redirect and get redirected again.
+REDIRECT_MEMORY_MINUTES = int(os.getenv("REDIRECT_MEMORY_MINUTES", "120"))
 REFLAG_COOLDOWN_MINUTES  = int(os.getenv("REFLAG_COOLDOWN_MINUTES", "15"))
 
 CHUNK_SIZE          = int(os.getenv("CHUNK_SIZE", "600"))
@@ -143,6 +149,21 @@ SUPPORT_PATTERNS = [
     r"\b(opencode|open claw|open code)\b",
     r"\b(bankr skill|skill package|install skill)\b",
     r"\b(alpha chat|alpha access)\b",
+    # ── Transaction / funds-movement vocabulary ───────────────────────────
+    # Added 2026-07-19 after a user asking "i have some missing coins in this
+    # transaction 0x..." scored ZERO and got the canned redirect. None of
+    # "transaction", "coins", "missing", or a raw tx hash were recognized,
+    # even though a pasted hash is about as strong a support signal as exists.
+    r"\b(transactions?|txn?s?|tx hash|hashe?s?)\b",
+    r"\b0x[a-fA-F0-9]{16,}\b",                     # pasted tx hash / address
+    r"\b(missing|lost|disappeared|vanished|unaccounted)\b",
+    r"\b(never (got|received|arrived|showed|came)|didn'?t (get|receive|arrive|show|come)|hasn'?t (arrived|shown|come))\b",
+    r"\b(coins?|funds?|money|deposits?|withdrawals?)\b",
+    r"\b(sent|sending|received|receiving|transfers?|transferred)\b",
+    r"\b(pending|stuck|failed|reverted|dropped)\b",
+    r"\b(usdc|usdt|weth|eth|dai)\b",
+    # Typo-tolerant swap: the original \bswaps?\b missed "swaped"/"swapd".
+    r"\bswap\w*\b",
 ]
 
 COMPILED_PATTERNS = [re.compile(p, re.IGNORECASE) for p in SUPPORT_PATTERNS]
@@ -592,6 +613,12 @@ class BankrSupportBot(discord.Client):
 
         self.recently_flagged:    dict[tuple, datetime] = {}
         self._handled_message_ids: set[int]             = set()
+        # (channel_id, user_id) -> datetime of the last polite redirect we
+        # sent them. A redirect does NOT open a conversation, so without this
+        # a user whose phrasing the keyword scorer under-counts gets the same
+        # canned line on every follow-up forever. See the intent gate in
+        # on_message: coming back after a redirect is itself the intent signal.
+        self._recent_redirects: dict[tuple, datetime]   = {}
         # Tracks users who have been asked "want a ticket?" but haven't answered yet.
         # Key: (channel_id, user_id)  Value: issue summary string
         self._pending_escalations: dict[tuple, str]     = {}
@@ -670,6 +697,16 @@ class BankrSupportBot(discord.Client):
 
             if len(self._handled_message_ids) > 1000:
                 self._handled_message_ids = set(sorted(self._handled_message_ids)[-500:])
+
+            # Drop redirect memory past its window so the dict can't grow
+            # without bound in a busy server.
+            if self._recent_redirects:
+                cutoff = datetime.now(timezone.utc) - timedelta(
+                    minutes=REDIRECT_MEMORY_MINUTES
+                )
+                self._recent_redirects = {
+                    k: v for k, v in self._recent_redirects.items() if v > cutoff
+                }
 
             now = datetime.now(timezone.utc)
             self.recently_flagged = {
@@ -1425,30 +1462,61 @@ Choose the single best-fit value from this fixed list ONLY:
 
             clean = self._clean_content(message)
 
-            if not has_active_convo and clean and not detect_support_intent(clean)[0]:
-                self._handled_message_ids.add(message.id)
-                has_korean = bool(re.search(r'[\uac00-\ud7af]', clean))
-                has_chinese = bool(re.search(r'[\u4e00-\u9fff]', clean))
-                if has_korean:
-                    redirect_msg = (
-                        "안녕하세요! 저는 Bankr 지원 봇입니다 😊 "
-                        "스왑, 지갑, 토큰 발행, API 등 Bankr 플랫폼에 관한 질문을 도와드립니다. "
-                        "무엇을 도와드릴까요?"
+            # Intent gate for the FIRST message of a conversation. Two
+            # relaxations over the bare INTENT_THRESHOLD, both aimed at the
+            # same failure mode: a genuine support question the keyword scorer
+            # under-counts (typos, vocabulary gaps) getting a canned redirect
+            # instead of an answer.
+            #
+            #  1. A direct REPLY to the bot is a far stronger engagement signal
+            #     than an @mention in passing — the user is answering us, often
+            #     continuing a thread whose conversation TTL quietly expired.
+            #     One topical hit is enough there.
+            #  2. If we already redirected this user recently and they came
+            #     back anyway, persisting IS the intent. Re-serving the same
+            #     canned line is the dead end we hit in production: a redirect
+            #     never opens a conversation, so Case 2 never picks the user
+            #     up and every follow-up re-ran the same failing check.
+            if not has_active_convo and clean:
+                _, intent_score = detect_support_intent(clean)
+                threshold = 1 if is_reply_to_bot else INTENT_THRESHOLD
+                redirect_key = (message.channel.id, message.author.id)
+                last_redirect = self._recent_redirects.get(redirect_key)
+                persisted = (
+                    last_redirect is not None
+                    and datetime.now(timezone.utc) - last_redirect
+                    < timedelta(minutes=REDIRECT_MEMORY_MINUTES)
+                )
+                if intent_score < threshold and not persisted:
+                    self._handled_message_ids.add(message.id)
+                    self._recent_redirects[redirect_key] = datetime.now(timezone.utc)
+                    has_korean = bool(re.search(r'[\uac00-\ud7af]', clean))
+                    has_chinese = bool(re.search(r'[\u4e00-\u9fff]', clean))
+                    if has_korean:
+                        redirect_msg = (
+                            "안녕하세요! 저는 Bankr 지원 봇입니다 😊 "
+                            "스왑, 지갑, 토큰 발행, API 등 Bankr 플랫폼에 관한 질문을 도와드립니다. "
+                            "무엇을 도와드릴까요?"
+                        )
+                    elif has_chinese:
+                        redirect_msg = (
+                            "你好！我是 Bankr 支持机器人 😊 "
+                            "我专门解答关于 Bankr 平台的问题，包括代币兑换、钱包、代币发行、API 等。"
+                            "有什么我可以帮你的吗？"
+                        )
+                    else:
+                        redirect_msg = (
+                            "Hey! I'm the Bankr support bot — I'm here to help with questions about the platform. "
+                            "Feel free to ask me anything about swaps, wallets, token launches, the API, or anything else Bankr-related! 😊"
+                        )
+                    await message.reply(redirect_msg, mention_author=False)
+                    log.info(
+                        f"Non-support mention from {message.author} "
+                        f"(score={intent_score} < threshold={threshold}, "
+                        f"reply_to_bot={bool(is_reply_to_bot)}), sent polite redirect: "
+                        f"{clean[:80]}"
                     )
-                elif has_chinese:
-                    redirect_msg = (
-                        "你好！我是 Bankr 支持机器人 😊 "
-                        "我专门解答关于 Bankr 平台的问题，包括代币兑换、钱包、代币发行、API 等。"
-                        "有什么我可以帮你的吗？"
-                    )
-                else:
-                    redirect_msg = (
-                        "Hey! I'm the Bankr support bot — I'm here to help with questions about the platform. "
-                        "Feel free to ask me anything about swaps, wallets, token launches, the API, or anything else Bankr-related! 😊"
-                    )
-                await message.reply(redirect_msg, mention_author=False)
-                log.info(f"Non-support mention from {message.author}, sent polite redirect")
-                return
+                    return
 
             self._handled_message_ids.add(message.id)
             await self._handle_support_message(message)
