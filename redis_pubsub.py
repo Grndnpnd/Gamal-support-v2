@@ -246,15 +246,37 @@ async def listen_for_reindex(on_signal) -> None:
             log.info("Listening for manual reindex signals")
             backoff = 2  # reset backoff after a successful (re)subscribe
 
-            async for message in pubsub.listen():
-                if message.get("type") != "message":
-                    continue  # ignore subscribe-confirmation frames
-                triggered_by = message.get("data", "unknown")
-                log.info(f"Reindex signal received (by {triggered_by})")
-                try:
-                    await on_signal(triggered_by)
-                except Exception as e:
-                    log.error(f"Reindex callback errored: {e}")
+            # NOTE on the loop shape: the obvious `async for msg in
+            # pubsub.listen()` has a production-fatal flaw — redis-py's
+            # health_check_interval only fires when a command is SENT, and a
+            # subscriber blocked in listen() never sends one. When the server
+            # silently drops the idle connection (Railway Redis idle reaping /
+            # failover), the socket goes half-open and listen() blocks forever
+            # on a dead pipe: no exception, no reconnect, a zombie subscriber.
+            # That is exactly how the bot went deaf to reindex signals for
+            # days while the API (which doesn't rely on pub/sub) kept working.
+            #
+            # Robust pattern instead: short-timeout get_message() polling with
+            # an explicit periodic PING. A dead connection makes the ping (or
+            # the next get_message) raise, which trips the reconnect loop.
+            last_ping = asyncio.get_event_loop().time()
+            while True:
+                message = await pubsub.get_message(
+                    ignore_subscribe_messages=True, timeout=1.0
+                )
+                if message is not None and message.get("type") == "message":
+                    triggered_by = message.get("data", "unknown")
+                    log.info(f"Reindex signal received (by {triggered_by})")
+                    try:
+                        await on_signal(triggered_by)
+                    except Exception as e:
+                        log.error(f"Reindex callback errored: {e}")
+
+                now = asyncio.get_event_loop().time()
+                if now - last_ping > 30:
+                    # Raises on a dead connection → outer except → resubscribe.
+                    await pubsub.ping()
+                    last_ping = now
 
         except asyncio.CancelledError:
             # Service is shutting down — exit cleanly, don't reconnect.
@@ -463,15 +485,28 @@ async def listen_for_article_sync(on_signal) -> None:
             log.info("Listening for article-sync signals")
             backoff = 2
 
-            async for message in pubsub.listen():
-                if message.get("type") != "message":
-                    continue
-                triggered_by = message.get("data", "unknown")
-                log.info(f"Article-sync signal received (by {triggered_by})")
-                try:
-                    await on_signal(triggered_by)
-                except Exception as e:
-                    log.error(f"Article-sync callback errored: {e}")
+            # Same zombie-connection guard as listen_for_reindex: blocking
+            # listen() never health-checks, so a server-side idle drop leaves
+            # a subscriber blocked forever on a half-open socket. Poll with a
+            # short timeout + explicit periodic ping so a dead connection
+            # raises and the reconnect loop recovers.
+            last_ping = asyncio.get_event_loop().time()
+            while True:
+                message = await pubsub.get_message(
+                    ignore_subscribe_messages=True, timeout=1.0
+                )
+                if message is not None and message.get("type") == "message":
+                    triggered_by = message.get("data", "unknown")
+                    log.info(f"Article-sync signal received (by {triggered_by})")
+                    try:
+                        await on_signal(triggered_by)
+                    except Exception as e:
+                        log.error(f"Article-sync callback errored: {e}")
+
+                now = asyncio.get_event_loop().time()
+                if now - last_ping > 30:
+                    await pubsub.ping()
+                    last_ping = now
 
         except asyncio.CancelledError:
             log.info("Article-sync subscriber cancelled — stopping")

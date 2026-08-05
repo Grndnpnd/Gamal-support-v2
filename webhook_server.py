@@ -521,7 +521,7 @@ async def _process_webhook_event(body: dict, event_type: str, event_id: str) -> 
                     log.info(f"Scheduled thread deletion for Plain thread {thread_id} -> Discord {discord_thread_id}")
                 else:
                     log.warning(f"No Discord thread mapped for resolved Plain thread {thread_id}")
-        return
+            return
 
         # ── Handle chat_sent / email_sent ─────────────────────────────────────────
 
@@ -543,39 +543,39 @@ async def _process_webhook_event(body: dict, event_type: str, event_id: str) -> 
         # Skip if no text
         if not message_text:
             log.info(f"Webhook event {event_type} has no text content, skipping")
-        return
+            return
 
         # Skip messages forwarded by our bot — they are prefixed with [discord-relay]
         # This prevents echo loops where forwarded messages get relayed back to Discord
         if message_text.startswith("[discord-relay]"):
             log.info("Skipping discord-relay prefixed message to prevent echo loop")
-        return
+            return
 
         actor_type = (created_by.get("actorType") or "").lower()
 
         # Skip customer events — avoid echoing the user's own messages back
         if actor_type == "customer":
             log.info("Skipping customer event to prevent echo loop")
-        return
+            return
 
         # Skip unknown actor types
         if actor_type not in ("user", "machineuser", "machine_user"):
             log.info(f"Skipping unknown actor type '{actor_type}'")
-        return
+            return
 
         # For machineUser events: only allow email_sent through since that's how
         # human agent email replies arrive (sent by support email machine user).
         # All other machineUser events (chat forwarding etc) are skipped.
         if actor_type in ("machineuser", "machine_user") and event_type != "thread.email_sent":
             log.info("Skipping non-email machineUser event")
-        return
+            return
 
         # Look up the Discord thread
         discord_thread_id = await get_discord_thread_id(thread_id)
 
         if not discord_thread_id:
             log.warning(f"No Discord thread mapped for Plain thread {thread_id}")
-        return
+            return
 
         # Content-level dedupe — catches the case where Plain emits two distinct
         # events (different event IDs) with the same logical message. Observed
@@ -595,7 +595,7 @@ async def _process_webhook_event(body: dict, event_type: str, event_id: str) -> 
             # doesn't get re-processed and re-checked.
             if event_id:
                 await _mark_relayed(event_id)
-        return
+            return
 
         # Mark as relayed before posting so retries are caught even if posting is
         # slow. Placed AFTER the thread-mapping check above, so an event that
