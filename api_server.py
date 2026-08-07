@@ -185,6 +185,13 @@ async def acme_probe(token: str):
     return PlainTextResponse("ok")
 
 
+@app.get("/", include_in_schema=False)
+async def root_redirect():
+    # The bare domain (gamal.cloud) lands people on the admin panel.
+    from fastapi.responses import RedirectResponse
+    return RedirectResponse("/admin")
+
+
 # Mount the admin panel routes (/admin/*). Imported here rather than at the
 # top of the file so a missing dependency in admin_routes.py (e.g.
 # itsdangerous, python-multipart) doesn't take down the agent API.
