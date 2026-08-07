@@ -64,6 +64,26 @@ ADMIN_SESSION_SECRET = os.getenv("ADMIN_SESSION_SECRET") or secrets.token_hex(32
 SESSION_COOKIE_NAME = "gamal_admin_session"
 SESSION_MAX_AGE = 60 * 60 * 12  # 12 hours
 
+# ── Google OAuth (Workspace SSO) ──────────────────────────────────────────────
+# Set GOOGLE_OAUTH_CLIENT_ID + GOOGLE_OAUTH_CLIENT_SECRET to enable
+# "Sign in with Google". Only verified accounts whose email domain is in
+# OAUTH_ALLOWED_DOMAINS (comma-separated, default bankr.bot) get a session.
+# Defense in depth: also set the OAuth consent screen to "Internal" in Google
+# Cloud Console so Google itself refuses accounts outside the Workspace org.
+GOOGLE_OAUTH_CLIENT_ID     = os.getenv("GOOGLE_OAUTH_CLIENT_ID", "")
+GOOGLE_OAUTH_CLIENT_SECRET = os.getenv("GOOGLE_OAUTH_CLIENT_SECRET", "")
+OAUTH_ALLOWED_DOMAINS = [
+    d.strip().lower()
+    for d in os.getenv("OAUTH_ALLOWED_DOMAINS", "bankr.bot").split(",")
+    if d.strip()
+]
+_GOOGLE_AUTH_URL  = "https://accounts.google.com/o/oauth2/v2/auth"
+_GOOGLE_TOKEN_URL = "https://oauth2.googleapis.com/token"
+_GOOGLE_USERINFO_URL = "https://openidconnect.googleapis.com/v1/userinfo"
+
+def _google_oauth_enabled() -> bool:
+    return bool(GOOGLE_OAUTH_CLIENT_ID and GOOGLE_OAUTH_CLIENT_SECRET)
+
 _serializer = URLSafeTimedSerializer(ADMIN_SESSION_SECRET, salt="gamal-admin")
 
 if not ADMIN_PASSWORD:
@@ -588,15 +608,27 @@ def _relative_time(iso_str: Optional[str]) -> str:
 @router.get("/login", response_class=HTMLResponse)
 async def login_form(error: Optional[str] = None):
     flash = f'<div class="flash error">{_esc(error)}</div>' if error else ""
+    google_btn = ""
+    if _google_oauth_enabled():
+        google_btn = """
+        <a href="/admin/auth/google" style="display:block; text-align:center;
+           margin-bottom:14px; padding:10px 12px; border-radius:6px;
+           background:#fff; color:#1f1f1f; font-weight:600;
+           text-decoration:none; border:1px solid #dadce0;">
+          Sign in with Google
+        </a>
+        <div class="dim" style="text-align:center; margin-bottom:14px;">— or —</div>
+        """
     body = f"""
     <div style="max-width: 380px; margin: 80px auto;">
       <div class="panel">
         <h3>Sign in</h3>
-        <p class="dim">Enter the admin password to manage overrides.</p>
+        <p class="dim">Sign in with your work Google account, or use the admin password.</p>
         {flash}
+        {google_btn}
         <form method="POST" action="/admin/login">
           <label>Password</label>
-          <input type="password" name="password" autocomplete="current-password" required autofocus>
+          <input type="password" name="password" autocomplete="current-password" required>
           <div style="margin-top: 16px;">
             <button type="submit">Sign in</button>
           </div>
@@ -642,6 +674,114 @@ async def login_submit(request: Request, password: str = Form(...)):
 async def logout():
     response = RedirectResponse("/admin/login", status_code=303)
     response.delete_cookie(SESSION_COOKIE_NAME)
+    return response
+
+
+# ─── Google OAuth (Workspace SSO) ─────────────────────────────────────────────
+
+def _oauth_redirect_uri(request: Request) -> str:
+    """
+    Build the callback URL from the request's own host, so the same code works
+    on both the railway.app URL and the custom domain — register BOTH exact
+    URIs in Google Cloud Console → Credentials → Authorized redirect URIs.
+    Force https: Railway terminates TLS at the edge, so request.url may say
+    http even though the browser used https, and Google requires the
+    registered scheme to match exactly.
+    """
+    base = str(request.base_url).rstrip("/")
+    if base.startswith("http://") and "localhost" not in base and "127.0.0.1" not in base:
+        base = "https://" + base[len("http://"):]
+    return f"{base}/admin/auth/google/callback"
+
+
+@router.get("/auth/google")
+async def google_auth_start(request: Request):
+    if not _google_oauth_enabled():
+        return RedirectResponse("/admin/login?error=Google+sign-in+not+configured", status_code=303)
+    # Signed, short-lived state for CSRF protection on the callback.
+    state = _serializer.dumps({"n": secrets.token_urlsafe(16)})
+    from urllib.parse import urlencode
+    params = urlencode({
+        "client_id": GOOGLE_OAUTH_CLIENT_ID,
+        "redirect_uri": _oauth_redirect_uri(request),
+        "response_type": "code",
+        "scope": "openid email",
+        "state": state,
+        # hd is a UX hint only (pre-selects the Workspace account picker) —
+        # never a security control. Real enforcement is the server-side
+        # domain check in the callback.
+        "hd": OAUTH_ALLOWED_DOMAINS[0] if OAUTH_ALLOWED_DOMAINS else "",
+        "prompt": "select_account",
+    })
+    return RedirectResponse(f"{_GOOGLE_AUTH_URL}?{params}", status_code=303)
+
+
+@router.get("/auth/google/callback")
+async def google_auth_callback(
+    request: Request,
+    code: Optional[str] = None,
+    state: Optional[str] = None,
+    error: Optional[str] = None,
+):
+    if error or not code or not state:
+        return RedirectResponse("/admin/login?error=Google+sign-in+cancelled", status_code=303)
+    # Verify the signed state (10-minute window).
+    try:
+        _serializer.loads(state, max_age=600)
+    except (BadSignature, SignatureExpired):
+        return RedirectResponse("/admin/login?error=Sign-in+expired+—+try+again", status_code=303)
+
+    import httpx
+    try:
+        async with httpx.AsyncClient(timeout=15) as client:
+            # Exchange the code server-side (client_secret never leaves us).
+            tok = await client.post(_GOOGLE_TOKEN_URL, data={
+                "code": code,
+                "client_id": GOOGLE_OAUTH_CLIENT_ID,
+                "client_secret": GOOGLE_OAUTH_CLIENT_SECRET,
+                "redirect_uri": _oauth_redirect_uri(request),
+                "grant_type": "authorization_code",
+            })
+            tok.raise_for_status()
+            access_token = tok.json().get("access_token")
+            if not access_token:
+                raise ValueError("no access_token in token response")
+            # Fetch identity over TLS direct from Google — no JWT parsing needed.
+            ui = await client.get(
+                _GOOGLE_USERINFO_URL,
+                headers={"Authorization": f"Bearer {access_token}"},
+            )
+            ui.raise_for_status()
+            info = ui.json()
+    except Exception as e:
+        log.error(f"Google OAuth exchange failed: {e}")
+        return RedirectResponse("/admin/login?error=Google+sign-in+failed", status_code=303)
+
+    email = (info.get("email") or "").lower()
+    verified = bool(info.get("email_verified"))
+    domain = email.split("@")[-1] if "@" in email else ""
+
+    # The actual gate: verified email on an allowed Workspace domain.
+    if not (verified and domain in OAUTH_ALLOWED_DOMAINS):
+        log.warning(f"OAuth login REFUSED for {email!r} (verified={verified})")
+        return RedirectResponse(
+            "/admin/login?error=Use+your+work+Google+account", status_code=303
+        )
+
+    response = RedirectResponse("/admin", status_code=303)
+    response.set_cookie(
+        SESSION_COOKIE_NAME,
+        _serializer.dumps({
+            "login_at": datetime.now(timezone.utc).isoformat(),
+            "email": email,
+            "via": "google",
+        }),
+        max_age=SESSION_MAX_AGE,
+        httponly=True,
+        samesite="lax",
+        secure=False,
+    )
+    log.info(f"Admin login successful via Google: {email}")
     return response
 
 
