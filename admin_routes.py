@@ -608,34 +608,63 @@ def _relative_time(iso_str: Optional[str]) -> str:
 @router.get("/login", response_class=HTMLResponse)
 async def login_form(error: Optional[str] = None):
     flash = f'<div class="flash error">{_esc(error)}</div>' if error else ""
-    google_btn = ""
-    if _google_oauth_enabled():
-        google_btn = """
-        <a href="/admin/auth/google" style="display:block; text-align:center;
-           margin-bottom:14px; padding:10px 12px; border-radius:6px;
-           background:#fff; color:#1f1f1f; font-weight:600;
-           text-decoration:none; border:1px solid #dadce0;">
-          Sign in with Google
-        </a>
-        <div class="dim" style="text-align:center; margin-bottom:14px;">— or —</div>
-        """
-    body = f"""
-    <div style="max-width: 380px; margin: 80px auto;">
-      <div class="panel">
-        <h3>Sign in</h3>
-        <p class="dim">Sign in with your work Google account, or use the admin password.</p>
-        {flash}
-        {google_btn}
-        <form method="POST" action="/admin/login">
+
+    _google_svg = (
+        '<svg width="18" height="18" viewBox="0 0 48 48" style="vertical-align:-3px;margin-right:10px">'
+        '<path fill="#EA4335" d="M24 9.5c3.54 0 6.71 1.22 9.21 3.6l6.85-6.85C35.9 2.38 30.47 0 24 0 14.62 0 6.51 5.38 2.56 13.22l7.98 6.19C12.43 13.72 17.74 9.5 24 9.5z"/>'
+        '<path fill="#4285F4" d="M46.98 24.55c0-1.57-.15-3.09-.38-4.55H24v9.02h12.94c-.58 2.96-2.26 5.48-4.78 7.18l7.73 6c4.51-4.18 7.09-10.36 7.09-17.65z"/>'
+        '<path fill="#FBBC05" d="M10.53 28.59c-.48-1.45-.76-2.99-.76-4.59s.27-3.14.76-4.59l-7.98-6.19C.92 16.46 0 20.12 0 24c0 3.88.92 7.54 2.56 10.78l7.97-6.19z"/>'
+        '<path fill="#34A853" d="M24 48c6.48 0 11.93-2.13 15.89-5.81l-7.73-6c-2.15 1.45-4.92 2.3-8.16 2.3-6.26 0-11.57-4.22-13.47-9.91l-7.98 6.19C6.51 42.62 14.62 48 24 48z"/>'
+        '</svg>'
+    )
+
+    password_form = f"""
+        <form method="POST" action="/admin/login" style="margin-top:12px;">
           <label>Password</label>
           <input type="password" name="password" autocomplete="current-password" required>
           <div style="margin-top: 16px;">
-            <button type="submit">Sign in</button>
+            <button type="submit">Sign in with password</button>
           </div>
         </form>
-      </div>
-    </div>
     """
+
+    if _google_oauth_enabled():
+        # Google is the primary path; the shared-password fallback lives
+        # behind a <details> toggle so the page stays clean (and no JS needed).
+        body = f"""
+        <div style="max-width: 380px; margin: 80px auto;">
+          <div class="panel" style="text-align:center; padding: 32px 28px;">
+            <img src="{_LOGO_DATA_URI}" width="44" height="44" alt="" style="margin-bottom:10px;">
+            <h3 style="margin:0 0 4px;">Gamal Admin</h3>
+            <p class="dim" style="margin:0 0 20px;">Sign in with your work account</p>
+            {flash}
+            <a href="/admin/auth/google" style="display:flex; align-items:center;
+               justify-content:center; padding:11px 12px; border-radius:8px;
+               background:#fff; color:#1f1f1f; font-weight:600; font-size:15px;
+               text-decoration:none; border:1px solid #dadce0;">
+              {_google_svg} Sign in with Google
+            </a>
+            <details style="margin-top:22px; text-align:left;">
+              <summary class="dim" style="cursor:pointer; text-align:center;
+                       font-size:13px; list-style:none;">
+                Use admin password instead
+              </summary>
+              {password_form}
+            </details>
+          </div>
+        </div>
+        """
+    else:
+        body = f"""
+        <div style="max-width: 380px; margin: 80px auto;">
+          <div class="panel">
+            <h3>Sign in</h3>
+            <p class="dim">Enter the admin password to manage overrides.</p>
+            {flash}
+            {password_form}
+          </div>
+        </div>
+        """
     return HTMLResponse(_page("Sign in", body, show_nav=False))
 
 
