@@ -169,6 +169,22 @@ app = FastAPI(
     lifespan=lifespan,
 )
 
+
+# ─── ACME / cert-issuance probes ─────────────────────────────────────────────
+# Railway's custom-domain certificate flow probes the app to confirm the
+# domain routes here before issuing TLS. The probe must get a 2xx,
+# unauthenticated. We answer at the canonical path AND at the
+# /admin/login-prefixed variant that appears when the prober gets bounced
+# through the auth redirect chain (/ → /admin → 303 /admin/login) and
+# re-resolves its challenge path relative to where it landed.
+from fastapi.responses import PlainTextResponse
+
+@app.get("/.well-known/acme-challenge/{token}", include_in_schema=False)
+@app.get("/admin/login/.well-known/acme-challenge/{token}", include_in_schema=False)
+async def acme_probe(token: str):
+    return PlainTextResponse("ok")
+
+
 # Mount the admin panel routes (/admin/*). Imported here rather than at the
 # top of the file so a missing dependency in admin_routes.py (e.g.
 # itsdangerous, python-multipart) doesn't take down the agent API.
