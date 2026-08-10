@@ -1074,8 +1074,9 @@ Choose the single best-fit value from this fixed list ONLY:
         if not self.tickets:
             log.warning("Plain not configured; cannot open ticket")
             return (
-                "\n\n⚠️ This looks like it needs human attention. "
-                "Please open a ticket in **#bug-reports** and our team will help you.",
+                "\n\n⚠️ This looks like it needs human attention, but I couldn't "
+                "open a ticket right now. Please ping a moderator here and "
+                "they'll get you sorted.",
                 None,
             )
 
@@ -1128,7 +1129,8 @@ Choose the single best-fit value from this fixed list ONLY:
         else:
             return (
                 "\n\n⚠️ I wasn't able to create a ticket automatically. "
-                "Please head to **#bug-reports** and our team will help you out.",
+                "Please try again in a few minutes, or ping a moderator here "
+                "and they can open one for you.",
                 None,
             )
 
