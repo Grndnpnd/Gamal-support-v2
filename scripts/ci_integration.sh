@@ -14,6 +14,8 @@
 set -uo pipefail
 cd "$(dirname "$0")/.."
 export COMPOSE_PROJECT_NAME="${COMPOSE_PROJECT_NAME:-supportci}"
+# The two web ports on this machine; set them when 8000 or 8080 is already in use.
+export API_HOST_PORT="${API_HOST_PORT:-8000}" WEBHOOK_HOST_PORT="${WEBHOOK_HOST_PORT:-8080}"
 fail=0
 ok()   { echo "ok    $*"; }
 bad()  { echo "FAIL  $*"; fail=1; }
@@ -44,7 +46,7 @@ wait_health() {   # name, url, seconds
   done
   echo "$t"
 }
-if s=$(wait_health api http://127.0.0.1:8000/health 900); then ok "the API answers its health check (after ${s}s)"; else bad "the API never answered its health check"; dc logs --tail 60 api; fi
+if s=$(wait_health api "http://127.0.0.1:${API_HOST_PORT}/health" 900); then ok "the API answers its health check (after ${s}s)"; else bad "the API never answered its health check"; dc logs --tail 60 api; fi
 
 # The bot and the webhook: everything up to Discord's refusal of the dummy token. (Logs are read into a variable
 # first: grep -q on a pipe would stop reading early and, with pipefail, look like a failure.)

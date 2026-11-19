@@ -2,6 +2,7 @@
 # token while production is running: two copies of one bot both answer every message. Use the test bot's token.
 #   cp example.env.example .env   (fill in the TEST bot's values)   then   docker compose up --build
 # Postgres and Redis are reachable only from the other containers; nothing but the api and the webhook has a port.
+# If 8000 or 8080 is taken on this machine: API_HOST_PORT=18000 WEBHOOK_HOST_PORT=18080 docker compose up
 services:
   bot:
     build: .
@@ -18,7 +19,7 @@ services:
     command: python entrypoint.py api_server.py
     env_file: .env
     environment: *stores
-    ports: ["127.0.0.1:8000:8000"]
+    ports: ["127.0.0.1:${API_HOST_PORT:-8000}:8000"]
     depends_on: [postgres, redis]
     restart: unless-stopped
   webhook:
@@ -26,7 +27,7 @@ services:
     command: python entrypoint.py webhook_server.py
     env_file: .env
     environment: *stores
-    ports: ["127.0.0.1:8080:8080"]
+    ports: ["127.0.0.1:${WEBHOOK_HOST_PORT:-8080}:8080"]
     depends_on: [redis]
     restart: unless-stopped
   postgres:

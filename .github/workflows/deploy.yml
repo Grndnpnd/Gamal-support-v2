@@ -8,7 +8,10 @@
 name: deploy
 on:
   push:
-    branches: [main]
+    # main is production. aws-container is the rehearsal branch in the personal repository: a push there deploys
+    # only while the stack names that branch as a second source (its RehearsalSubject), and only where the
+    # repository's variables are set.
+    branches: [main, aws-container]
   workflow_dispatch:
 permissions:
   id-token: write
