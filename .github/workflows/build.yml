@@ -1,0 +1,35 @@
+# Proves the image builds and the app's code loads inside it. Touches no account and holds no secret.
+# Runs on every branch but main (main is built by deploy.yml) and on pull requests.
+name: build
+on:
+  push:
+    branches-ignore: [main]
+  pull_request:
+permissions:
+  contents: read
+jobs:
+  image:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Build the image
+        run: docker build -t support:test .
+      - name: Every module compiles, and the search model is in the image (no network at start)
+        run: |
+          docker run --rm --network none support:test python -m compileall -q .
+          docker run --rm --network none support:test python -c "import discord, fastapi, asyncpg, redis, chromadb; from sentence_transformers import SentenceTransformer; print(SentenceTransformer('all-MiniLM-L6-v2').encode(['hello']).shape)"
+      - name: The entrypoint refuses anything but the app's own processes
+        run: |
+          if docker run --rm support:test python entrypoint.py /bin/sh; then echo "entrypoint started a shell"; exit 1; fi
+      - name: Image size
+        run: docker image inspect support:test --format '{{.Size}}' | awk '{printf "%.0f MB\n", $1/1048576}'
+  stack:
+    # The whole stack on the runner: the API and webhook answer, the bot gets as far as Discord's sign-in with a
+    # dummy token, nothing but the two web ports is published, and the data copy moves a seeded Postgres and Redis.
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Run the stack and its checks
+        run: bash scripts/ci_integration.sh

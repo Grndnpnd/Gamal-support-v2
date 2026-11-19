@@ -1,0 +1,47 @@
+# On a push to main: build the image, push it to the stack's registry, and roll it out by updating the stack's
+# ImageTag (nothing else about the stack can change from here). No AWS key is stored: GitHub signs in as the
+# stack's deploy role, which only this repository's main branch may assume.
+#
+# Set once on the repository (Settings > Secrets and variables > Actions > Variables), from the stack's outputs:
+#   AWS_REGION, AWS_DEPLOY_ROLE_ARN, AWS_CLOUDFORMATION_ROLE_ARN, AWS_STACK (the stack's name), AWS_IMAGE_REPOSITORY
+# Until AWS_DEPLOY_ROLE_ARN is set this workflow does nothing.
+name: deploy
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+permissions:
+  id-token: write
+  contents: read
+concurrency:
+  group: deploy
+  cancel-in-progress: false
+jobs:
+  deploy:
+    if: ${{ vars.AWS_DEPLOY_ROLE_ARN != '' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    env:
+      TAG: ${{ github.sha }}
+      REPOSITORY: ${{ vars.AWS_IMAGE_REPOSITORY }}
+      STACK: ${{ vars.AWS_STACK }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd # v6.3.0
+        with:
+          role-to-assume: ${{ vars.AWS_DEPLOY_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION }}
+      - name: Build and push
+        run: |
+          aws ecr get-login-password | docker login --username AWS --password-stdin "${REPOSITORY%%/*}"
+          docker build -t "$REPOSITORY:$TAG" .
+          docker push "$REPOSITORY:$TAG"
+      - name: Roll it out
+        run: |
+          # Every parameter keeps its value except the image tag.
+          params=$(aws cloudformation describe-stacks --stack-name "$STACK" --query 'Stacks[0].Parameters[].ParameterKey' --output text | tr '\t' '\n' | grep -v '^ImageTag$' | sed 's/.*/ParameterKey=&,UsePreviousValue=true/' | tr '\n' ' ')
+          aws cloudformation update-stack --stack-name "$STACK" --use-previous-template --capabilities CAPABILITY_NAMED_IAM \
+            --role-arn "${{ vars.AWS_CLOUDFORMATION_ROLE_ARN }}" --parameters ParameterKey=ImageTag,ParameterValue="$TAG" $params
+          aws cloudformation wait stack-update-complete --stack-name "$STACK"
+      - name: What is running
+        run: aws cloudformation describe-stacks --stack-name "$STACK" --query 'Stacks[0].[StackStatus,Parameters[?ParameterKey==`ImageTag`].ParameterValue|[0]]' --output text
