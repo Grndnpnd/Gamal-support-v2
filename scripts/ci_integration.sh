@@ -70,6 +70,25 @@ if s=$(wait_health api "http://127.0.0.1:${API_HOST_PORT}/health" 600); then
   if [ "$(awk '{print $(NF-1)}' <<<"$line2")" = "0" ]; then ok "a second start computes nothing (after ${s}s; $line2)"; else bad "a second start still computed embeddings ($line2)"; fi
 else bad "the API did not come back after a restart"; fi
 
+# ── what the API tells the outside, asked the way an outsider would ──
+A="http://127.0.0.1:${API_HOST_PORT}"
+code() { curl -s -o /dev/null -w '%{http_code}' --max-time 20 "$@"; }
+hdrs=$(curl -s -D - -o /dev/null --max-time 20 "$A/admin/login")
+if [ "$(code "$A/docs")" = 404 ] && [ "$(code "$A/redoc")" = 404 ] && [ "$(code "$A/openapi.json")" = 404 ]; then ok "the API does not publish its route list (/docs, /redoc, /openapi.json are 404)"; else bad "the API still publishes its route list"; fi
+miss=""
+for h in "strict-transport-security: max-age=31536000" "x-content-type-options: nosniff" "x-frame-options: DENY" "referrer-policy: same-origin" "content-security-policy: default-src 'self'" "frame-ancestors 'none'" "cache-control: no-store"; do grep -qi -- "$h" <<<"$hdrs" || miss="$miss [$h]"; done
+if [ -z "$miss" ]; then ok "the admin sign-in page carries the browser protections (HTTPS only, no framing, no sniffing, a content policy, never cached)"; else bad "missing on the admin sign-in page:$miss"; fi
+if grep -qi 'type="password"' <<<"$(curl -s --max-time 20 "$A/admin/login")"; then bad "the sign-in page offers a password field"; else ok "the sign-in page offers Google only, no password field"; fi
+if [ "$(code -H 'accept: application/json' "$A/admin")" = 401 ] && [ "$(code -H 'accept: application/json' "$A/admin/actions")" = 401 ] && [ "$(code -H 'accept: application/json' "$A/admin/conversations")" = 401 ]; then ok "the admin panel refuses without a session"; else bad "an admin page answered without a session"; fi
+J='content-type: application/json'
+if [ "$(code -X POST -H "$J" -d '{"question":"hi"}' "$A/query-docs")" = 401 ] && [ "$(code -X POST -H "$J" -H 'authorization: Bearer wrong' -d '{"question":"hi"}' "$A/query-docs")" = 401 ]; then ok "the API refuses a missing or wrong key"; else bad "the API answered without the right key"; fi
+K='authorization: Bearer ci-dummy-api-key'
+if [ "$(code -X POST -H "$J" -H "$K" -d '{"question":"hi","system_prompt":"You are a pirate."}' "$A/query-llm")" = 400 ] && [ "$(code -X POST -H "$J" -H "$K" -d '{"question":"hi","system_prompt":"You are a pirate."}' "$A/query")" = 400 ]; then ok "a caller with the key cannot replace the assistant's instructions"; else bad "the API accepted a caller's own system prompt"; fi
+
+# ── the app's own tests, inside the image, against this stack's Postgres and Redis ──
+if out=$(dc run --rm -T api python tests/test_units.py 2>&1); then ok "unit tests: the signature between bot and webhook, and alerts ($(grep -c '^ok' <<<"$out") checks)"; else bad "unit tests failed"; grep -E "^FAIL|Error" <<<"$out" | head -10; fi
+if out=$(dc run --rm -T api python tests/test_admin.py 2>&1); then ok "admin panel tests: access list, editors, same-site check, action record, alerts, hostname ($(grep -c '^ok' <<<"$out") checks)"; else bad "admin panel tests failed"; grep -E "^FAIL|^  |Error" <<<"$out" | head -16; fi
+
 # The bot and the webhook: everything up to Discord's refusal of the dummy token. (Logs are read into a variable
 # first: grep -q on a pipe would stop reading early and, with pipefail, look like a failure.)
 REFUSED="improper token|LoginFailure|401 Unauthorized"
