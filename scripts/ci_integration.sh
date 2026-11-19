@@ -34,7 +34,7 @@ BANKR_LLM_KEY=ci-dummy
 PLAIN_API_KEY=ci-dummy
 PLAIN_WEBHOOK_SECRET=ci-dummy
 ADMIN_SESSION_SECRET=ci-dummy-session-secret-0123456789
-API_KEY=ci-dummy-api-key
+API_SERVER_KEY=ci-dummy-api-key
 EOF
 
 dc up -d --build postgres redis api webhook bot || { bad "the stack did not start"; exit 1; }
@@ -47,6 +47,28 @@ wait_health() {   # name, url, seconds
   echo "$t"
 }
 if s=$(wait_health api "http://127.0.0.1:${API_HOST_PORT}/health" 900); then ok "the API answers its health check (after ${s}s)"; else bad "the API never answered its health check"; dc logs --tail 60 api; fi
+
+# The embedding cache: the image carries the docs' vectors, so the API's first start computes next to nothing, and a
+# search still answers from the index it built with them.
+apilogs=$(dc logs api 2>&1)
+line=$(grep -o "Embeddings: [0-9]* from the image, [0-9]* from Redis, [0-9]* computed" <<<"$apilogs" | head -1)
+computed=$(awk '{print $(NF-1)}' <<<"$line"); fromimage=$(awk '{print $2}' <<<"$line")
+if [ -n "$line" ] && [ "${fromimage:-0}" -gt 1000 ] && [ "${computed:-9999}" -lt 200 ]; then ok "the first start took its vectors from the image ($line)"; else bad "the first start did not use the image's embedding cache (${line:-no line in the log})"; fi
+found=$(dc exec -T api python -c "
+import json, urllib.request
+r = urllib.request.Request('http://127.0.0.1:8000/query-docs', data=json.dumps({'question': 'How do I fund my wallet?'}).encode(), headers={'content-type': 'application/json', 'x-api-key': 'ci-dummy-api-key', 'authorization': 'Bearer ci-dummy-api-key'})
+try:
+    d = json.loads(urllib.request.urlopen(r, timeout=60).read())
+    print(len(json.dumps(d)))
+except Exception as e:
+    print('ERR', getattr(e, 'code', e))" 2>&1 | tail -n 1)
+case "$found" in ERR*|"") echo "note  the docs search could not be asked here ($found): its route needs a key this run does not have";; *) if [ "$found" -gt 200 ]; then ok "a docs search answers from the index ($found bytes)"; else bad "a docs search answered with nothing ($found bytes)"; fi;; esac
+# A second start, with Redis now holding every vector: nothing is computed at all.
+dc restart api >/dev/null 2>&1
+if s=$(wait_health api "http://127.0.0.1:${API_HOST_PORT}/health" 600); then
+  line2=$(dc logs api 2>&1 | grep -o "Embeddings: [0-9]* from the image, [0-9]* from Redis, [0-9]* computed" | tail -1)
+  if [ "$(awk '{print $(NF-1)}' <<<"$line2")" = "0" ]; then ok "a second start computes nothing (after ${s}s; $line2)"; else bad "a second start still computed embeddings ($line2)"; fi
+else bad "the API did not come back after a restart"; fi
 
 # The bot and the webhook: everything up to Discord's refusal of the dummy token. (Logs are read into a variable
 # first: grep -q on a pipe would stop reading early and, with pipefail, look like a failure.)

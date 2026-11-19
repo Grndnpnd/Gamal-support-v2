@@ -16,6 +16,7 @@ import os
 
 import chromadb
 from chromadb.utils import embedding_functions
+import emb_cache
 
 from llm_response import LLMResponse
 
@@ -31,6 +32,8 @@ BANKR_LLM_MODEL = os.getenv("BANKR_LLM_MODEL", "gemini-3-flash")
 
 DOCS_URL              = os.getenv("DOCS_URL", "https://docs.bankr.bot/llms-full.txt")
 DOCS_REFRESH_HOURS    = int(os.getenv("DOCS_REFRESH_HOURS", "12"))
+# The embedding model. Its name is part of every cached vector's key (emb_cache.py), and the Dockerfile fetches it.
+EMBED_MODEL           = "all-MiniLM-L6-v2"
 
 CHUNK_SIZE          = int(os.getenv("CHUNK_SIZE", "600"))
 CHUNK_OVERLAP       = int(os.getenv("CHUNK_OVERLAP", "80"))
@@ -59,7 +62,7 @@ class SemanticDocsManager:
 
         self._client = chromadb.Client()
         self._ef = embedding_functions.SentenceTransformerEmbeddingFunction(
-            model_name="all-MiniLM-L6-v2"
+            model_name=EMBED_MODEL
         )
         self._collection = self._client.get_or_create_collection(
             name="bankr_docs",
@@ -202,11 +205,16 @@ class SemanticDocsManager:
         except Exception:
             pass
 
+        # Vectors come from the embedding cache where it has them (see emb_cache.py); only chunks it has never seen
+        # are computed. The vectors are the model's own either way, so search results do not change.
+        vectors = emb_cache.embed_with_cache(chunks, self._ef, EMBED_MODEL)
+
         batch_size = 64
         for i in range(0, len(chunks), batch_size):
             batch = chunks[i:i + batch_size]
             self._collection.add(
                 documents=batch,
+                embeddings=vectors[i:i + batch_size],
                 ids=[f"chunk_{i + j}" for j in range(len(batch))],
                 metadatas=[{"source": "bankr_docs", "index": i + j}
                            for j in range(len(batch))],

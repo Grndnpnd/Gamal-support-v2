@@ -19,6 +19,9 @@ RUN python -c "from sentence_transformers import SentenceTransformer; SentenceTr
 ENV HF_HUB_OFFLINE=1
 
 COPY . .
+# The docs as they are now, already embedded (emb_cache.py): a first start then computes almost nothing.
+# Never fails the build: without it a start embeds everything itself, as before.
+RUN python build_emb_cache.py
 RUN useradd --create-home --uid 10001 app && chown -R app:app /app /opt/models
 USER app
 
