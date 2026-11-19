@@ -2,9 +2,10 @@
 # Runs the whole stack from docker-compose.yml on one machine and checks what can be checked without a real Discord
 # bot token or any real key. Used by .github/workflows/build.yml; runs the same on any machine with Docker.
 #
-#   1. the API and the webhook start and answer their health checks;
-#   2. the bot gets all the way to signing in to Discord (model loaded, stores connected) and is refused only
-#      because the token here is a dummy;
+#   1. the API starts and answers its health check;
+#   2. the bot and the webhook each get all the way to signing in to Discord (for the bot: search model loaded
+#      first) and are refused only because the token here is a dummy. Both sign in at start, so neither can be
+#      shown answering without a real token;
 #   3. nothing but the API and the webhook is reachable from outside the containers;
 #   4. migrate_data.py copies a seeded "old" Postgres and Redis into the stack's own, counts matching, with ids
 #      carrying on after the copied rows.
@@ -43,15 +44,29 @@ wait_health() {   # name, url, seconds
   done
   echo "$t"
 }
-if s=$(wait_health webhook http://127.0.0.1:8080/health 120); then ok "the webhook answers its health check (after ${s}s)"; else bad "the webhook never answered its health check"; dc logs --tail 40 webhook; fi
 if s=$(wait_health api http://127.0.0.1:8000/health 900); then ok "the API answers its health check (after ${s}s)"; else bad "the API never answered its health check"; dc logs --tail 60 api; fi
 
-# The bot: everything up to Discord's refusal of the dummy token.
-t=0; until dc logs bot 2>&1 | grep -qiE "improper token|LoginFailure|401 Unauthorized"; do t=$((t + 5)); [ "$t" -ge 900 ] && break; sleep 5; done
-if dc logs bot 2>&1 | grep -qiE "improper token|LoginFailure|401 Unauthorized"; then ok "the bot started and reached Discord's sign-in, refused only for the dummy token (after ${t}s)"; else bad "the bot never reached Discord's sign-in"; dc logs --tail 60 bot; fi
-# With a dummy token the bot would restart for ever, loading the model each time: it has shown what it can here.
-dc stop bot >/dev/null 2>&1
-if dc logs bot api webhook 2>&1 | grep -qE "^.*entrypoint: starting (bot|api_server|webhook_server)\.py"; then ok "each process was started through the entrypoint"; else bad "the entrypoint line is missing from the logs"; fi
+# The bot and the webhook: everything up to Discord's refusal of the dummy token. (Logs are read into a variable
+# first: grep -q on a pipe would stop reading early and, with pipefail, look like a failure.)
+REFUSED="improper token|LoginFailure|401 Unauthorized"
+reached() {   # service, seconds
+  local t=0 logs
+  while :; do
+    logs=$(dc logs "$1" 2>&1)
+    if grep -qiE "$REFUSED" <<<"$logs"; then echo "$t"; return 0; fi
+    t=$((t + 5)); [ "$t" -ge "$2" ] && return 1; sleep 5
+  done
+}
+if s=$(reached bot 900); then ok "the bot started, loaded the search model and reached Discord's sign-in, refused only for the dummy token (after ${s}s)"; else bad "the bot never reached Discord's sign-in"; dc logs --tail 60 bot; fi
+botlogs=$(dc logs bot 2>&1)
+if grep -q "Loading SentenceTransformer model" <<<"$botlogs" && ! grep -qiE "Traceback.*huggingface|ConnectionError.*huggingface" <<<"$botlogs"; then ok "the search model loaded from the image, with no call to the model host"; else bad "the search model did not load from the image"; fi
+if s=$(reached webhook 300); then ok "the webhook process started and reached Discord's sign-in, refused only for the dummy token (after ${s}s)"; else bad "the webhook process never reached Discord's sign-in"; dc logs --tail 60 webhook; fi
+# With a dummy token both would restart for ever: they have shown what they can here.
+dc stop bot webhook >/dev/null 2>&1
+all=$(dc logs bot api webhook 2>&1)
+missing=""
+for proc in bot api_server webhook_server; do grep -q "entrypoint: starting ${proc}.py" <<<"$all" || missing="$missing $proc"; done
+if [ -z "$missing" ]; then ok "each process was started through the entrypoint"; else bad "not started through the entrypoint:$missing"; fi
 
 # Only the two web ports are published, and only on this machine.
 ports=$(docker ps --filter "label=com.docker.compose.project=${COMPOSE_PROJECT_NAME}" --format '{{.Names}} {{.Ports}}' | grep -E '(0\.0\.0\.0|\[::\]):' || true)
@@ -70,7 +85,7 @@ seed='
 import asyncio, os, asyncpg, db, redis.asyncio as aioredis
 async def main():
     c = await asyncpg.connect(os.environ["OLD_PG"])
-    await c.execute(db._SCHEMA); await c.execute(db._SIGNIN_SCHEMA)
+    await c.execute(db._SCHEMA)
     await c.executemany("insert into conversations (id, source, user_id, question, topic, response_source) values ($1, $2, $3, $4, $5, $6)",
                         [(i, "discord", str(1000 + i), "question %d with unicode 链智 and a quote \x27" % i, "wallets", "docs") for i in range(1, 2501)])
     await c.execute("select setval(pg_get_serial_sequence(\x27public.conversations\x27, \x27id\x27), 2500)")

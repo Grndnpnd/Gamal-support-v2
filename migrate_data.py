@@ -51,7 +51,9 @@ async def postgres():
         if MODE == "copy":
             # The destination gets the app's own tables first, exactly as the app would make them at its first start.
             import db
-            await dst.execute(db._SCHEMA); await dst.execute(db._SIGNIN_SCHEMA)
+            # (Every schema the app's db module carries: older versions have one, newer ones more.)
+            for name in sorted(n for n in dir(db) if n.endswith("_SCHEMA") and isinstance(getattr(db, n), str)):
+                await dst.execute(getattr(db, name))
         have = set(await tables(dst))
         for t in await tables(src):
             n_src = await src.fetchval(f"select count(*) from {ident(t)}")
