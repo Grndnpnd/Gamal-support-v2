@@ -28,6 +28,7 @@ ENV vars:
 import asyncio
 import logging
 import os
+import secrets
 from datetime import datetime, timezone
 from typing import Optional
 
@@ -47,6 +48,7 @@ from redis_pubsub import (
     save_article_sync_proposal,
 )
 import article_sync
+import alerts
 import db
 
 load_dotenv()
@@ -81,6 +83,7 @@ async def lifespan(app: FastAPI):
     app.state.docs_manager = docs
     app.state.llm_router   = ollama
     await db.init_db()  # no-op if DATABASE_URL is unset
+    alerts.alert("The API and admin panel started (a deploy or a restart)")
 
     # Listen for manual docs re-index signals from the admin panel.
     async def _on_reindex_signal(triggered_by: str):
@@ -162,12 +165,44 @@ async def lifespan(app: FastAPI):
     await db.close_db()
 
 
+# The interactive docs and the machine-readable route list name every route this process has, the admin panel's
+# included. They are off unless API_DOCS=true (a local run).
+_API_DOCS = os.getenv("API_DOCS", "").strip().lower() == "true"
+# A caller may supply its own system prompt only where ALLOW_SYSTEM_PROMPT_OVERRIDE=true. Otherwise the API answers
+# as the support assistant and as nothing else: one leaked key must not turn it into a general-purpose model.
+ALLOW_SYSTEM_PROMPT_OVERRIDE = os.getenv("ALLOW_SYSTEM_PROMPT_OVERRIDE", "").strip().lower() == "true"
+
 app = FastAPI(
     title="Bankr Support API",
     description="Grounded doc search and LLM query endpoints for external agents.",
     version="1.0.0",
     lifespan=lifespan,
+    docs_url="/docs" if _API_DOCS else None,
+    redoc_url="/redoc" if _API_DOCS else None,
+    openapi_url="/openapi.json" if _API_DOCS else None,
 )
+
+# What a browser is told about every answer from this process. The admin panel's pages use inline scripts and
+# styles and load one chart library from cdnjs, so those are allowed; nothing may frame the panel, load plugins,
+# change the page's base address, or post its forms anywhere but here and Google's sign-in.
+_CSP = ("default-src 'self'; script-src 'self' 'unsafe-inline' https://cdnjs.cloudflare.com; style-src 'self' 'unsafe-inline'; "
+        "img-src 'self' data: https:; object-src 'none'; base-uri 'self'; frame-ancestors 'none'; "
+        "form-action 'self' https://accounts.google.com")
+
+
+@app.middleware("http")
+async def _security_headers(request: Request, call_next):
+    response = await call_next(request)
+    h = response.headers
+    h.setdefault("Strict-Transport-Security", "max-age=31536000")
+    h.setdefault("X-Content-Type-Options", "nosniff")
+    h.setdefault("X-Frame-Options", "DENY")
+    h.setdefault("Referrer-Policy", "same-origin")
+    if "text/html" in h.get("content-type", ""):
+        h.setdefault("Content-Security-Policy", _CSP)
+    if request.url.path.startswith("/admin"):
+        h.setdefault("Cache-Control", "no-store")
+    return response
 
 
 # ─── ACME / cert-issuance probes ─────────────────────────────────────────────
@@ -233,8 +268,16 @@ def verify_token(credentials: HTTPAuthorizationCredentials = Security(security))
     """Validate the Bearer token if API_SERVER_KEY is set."""
     if not API_SERVER_KEY:
         return  # No key configured — open access (dev only)
-    if not credentials or credentials.credentials != API_SERVER_KEY:
+    # Compared in constant time, so how long a refusal takes says nothing about how much of a guess was right.
+    if not credentials or not secrets.compare_digest(credentials.credentials.encode(), API_SERVER_KEY.encode()):
+        alerts.alert("A call to the support API used a missing or wrong key", key="api-bad-key", every=600)
         raise HTTPException(status_code=401, detail="Invalid or missing API key")
+
+
+def _refuse_system_prompt(req) -> None:
+    """A request that brings its own system prompt is refused unless this deployment allows it."""
+    if getattr(req, "system_prompt", None) and not ALLOW_SYSTEM_PROMPT_OVERRIDE:
+        raise HTTPException(status_code=400, detail="system_prompt is not accepted: this API answers as the Bankr support assistant only")
 
 
 # ─── Request / Response Models ────────────────────────────────────────────────
@@ -337,6 +380,7 @@ async def query_llm(
     log.info(f"[/query-llm] question={req.question[:80]} grounded={bool(req.context)}")
 
     grounded = bool(req.context and req.context.strip())
+    _refuse_system_prompt(req)
 
     if req.system_prompt:
         system = req.system_prompt
@@ -415,6 +459,7 @@ async def query_combined(
 
     log.info(f"[/query] combined call, question={req.question[:80]}")
 
+    _refuse_system_prompt(req)
     # Step 1: fetch docs
     context = await docs.query(req.question)
 

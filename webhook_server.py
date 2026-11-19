@@ -44,6 +44,7 @@ from redis_map import (
     delete_active_ticket,
 )
 import db
+import internal_auth
 
 load_dotenv()
 
@@ -671,6 +672,11 @@ async def handle_cancel_deletion(request: web.Request) -> web.Response:
         thread_id = int(body.get("thread_id", 0))
         if not thread_id:
             return web.Response(status=400, text="missing thread_id")
+        # Only the bot may ask for this: the call carries a signature made with a secret both processes hold
+        # (internal_auth.py). This process has a public address, so an unsigned call is anyone's.
+        if not internal_auth.verify(request.headers.get(internal_auth.HEADER), "cancel-deletion", thread_id):
+            log.warning("cancel-deletion refused: missing or wrong signature")
+            return web.Response(status=403, text="forbidden")
         cancelled = cancel_thread_deletion(thread_id)
         return web.json_response({"cancelled": cancelled})
     except Exception as e:
@@ -679,7 +685,19 @@ async def handle_cancel_deletion(request: web.Request) -> web.Response:
 
 
 async def start_webhook_server():
-    app = web.Application()
+    @web.middleware
+    async def _security_headers(request, handler):
+        try:
+            response = await handler(request)
+        except web.HTTPException as e:
+            response = e
+        response.headers.setdefault("Strict-Transport-Security", "max-age=31536000")
+        response.headers.setdefault("X-Content-Type-Options", "nosniff")
+        response.headers.setdefault("X-Frame-Options", "DENY")
+        response.headers.setdefault("Cache-Control", "no-store")
+        return response
+
+    app = web.Application(middlewares=[_security_headers])
     app.router.add_post("/plain-webhook", handle_plain_webhook)
     app.router.add_post("/cancel-deletion", handle_cancel_deletion)
     app.router.add_get("/health", lambda r: web.Response(text="OK"))
