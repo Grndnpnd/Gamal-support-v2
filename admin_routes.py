@@ -21,6 +21,8 @@ sufficient for a single-admin internal tool. If you ever expose this to
 the public internet, add a proper CSRF token.
 """
 
+import re
+import alerts
 import asyncio
 import logging
 import os
@@ -57,6 +59,24 @@ log = logging.getLogger(__name__)
 # ─── Config ───────────────────────────────────────────────────────────────────
 
 ADMIN_PASSWORD = os.getenv("ADMIN_PASSWORD", "")
+# People sign in with their work Google account. The shared admin password works only where this is set to
+# "true": local development, and as the way back in if Google sign-in ever breaks. Production leaves it unset.
+ADMIN_PASSWORD_LOGIN = os.getenv("ADMIN_PASSWORD_LOGIN", "").strip().lower() == "true"
+
+# Who may use the panel, by name. Being on the company's Google Workspace is not enough once these are set:
+#   ADMIN_ALLOWED_EMAILS   the accounts that may sign in (comma separated). Empty = any account on an allowed
+#                          domain, which is how it was; the panel says so on every page until a list is set.
+#   ADMIN_EDITORS          of those, the accounts that may change what the bot says or does (overrides, busy mode,
+#                          re-index, publishing help-centre articles). Empty = everyone who may sign in.
+#   ADMIN_ALLOWED_HOSTS    the hostnames the panel answers on (e.g. gamal.cloud). Empty = any. On another host
+#                          every /admin address is a 404, so the panel is not also reachable on the host's default name.
+# Removing someone from a list takes effect on their next request, not when their cookie runs out.
+def _list(name: str) -> list[str]:
+    return [x.strip().lower() for x in os.getenv(name, "").split(",") if x.strip()]
+
+ADMIN_ALLOWED_EMAILS = _list("ADMIN_ALLOWED_EMAILS")
+ADMIN_EDITORS = _list("ADMIN_EDITORS")
+ADMIN_ALLOWED_HOSTS = _list("ADMIN_ALLOWED_HOSTS")
 # Session cookie signing secret. If not set we generate a random one at boot,
 # which means cookies invalidate on every restart — fine for a small team,
 # annoying if it bothers you. Set ADMIN_SESSION_SECRET explicitly to persist.
@@ -86,70 +106,175 @@ def _google_oauth_enabled() -> bool:
 
 _serializer = URLSafeTimedSerializer(ADMIN_SESSION_SECRET, salt="gamal-admin")
 
-if not ADMIN_PASSWORD:
-    log.warning(
-        "ADMIN_PASSWORD not set — admin panel will REJECT all logins. "
-        "Set it in your environment before deploying."
-    )
+if ADMIN_PASSWORD_LOGIN and not ADMIN_PASSWORD:
+    log.warning("ADMIN_PASSWORD_LOGIN is on but ADMIN_PASSWORD is not set: password sign-in will refuse everyone.")
+if not ADMIN_PASSWORD_LOGIN and not _google_oauth_enabled():
+    log.warning("Google sign-in is not configured and password sign-in is off: nobody can sign in to the admin panel.")
 
-router = APIRouter(prefix="/admin", tags=["admin"])
+def _host_gate(request: Request) -> None:
+    """With ADMIN_ALLOWED_HOSTS set, the panel exists only on those hostnames."""
+    if not ADMIN_ALLOWED_HOSTS:
+        return
+    host = (request.headers.get("host") or "").split(":")[0].lower()
+    if host not in ADMIN_ALLOWED_HOSTS:
+        raise HTTPException(status_code=404, detail="Not found")
+
+
+router = APIRouter(prefix="/admin", tags=["admin"], dependencies=[Depends(_host_gate)])
 
 
 # ─── Auth helpers ─────────────────────────────────────────────────────────────
 
 def _make_session_token() -> str:
-    """Create a fresh signed token for a successful login."""
-    return _serializer.dumps({"login_at": datetime.now(timezone.utc).isoformat()})
+    """Create a fresh signed token for a successful password login."""
+    return _serializer.dumps({"login_at": datetime.now(timezone.utc).isoformat(), "via": "password"})
+
+
+def _address_hash(request: Request) -> Optional[str]:
+    """The caller's address as the edge proxy saw it (last X-Forwarded-For entry), as a keyed hash. The address
+    itself is never stored: the same code means the same place, and nothing more."""
+    import hashlib, hmac as _hmac
+    parts = [p.strip() for p in (request.headers.get("x-forwarded-for") or "").split(",") if p.strip()]
+    ip = parts[-1] if parts else (request.client.host if request.client else "")
+    if not ip:
+        return None
+    return _hmac.new(ADMIN_SESSION_SECRET.encode(), f"signin-address:{ip}".encode(), hashlib.sha256).hexdigest()[:16]
+
+
+async def _record_signin(request: Request, method: str, outcome: str, email: Optional[str] = None) -> None:
+    """Write one sign-in attempt to the record (db.admin_signins) and to the log."""
+    (log.info if outcome == "ok" else log.warning)(f"Admin sign-in {outcome} via {method}{f' for {email}' if email else ''}")
+    if outcome != "ok":
+        # At most one of these every ten minutes, with a count of the rest: a burst is one message, not a flood.
+        alerts.alert(f"Admin sign-in refused ({_SIGNIN_OUTCOME.get(outcome, outcome)}) via {method}{f' for {email}' if email else ''}", key="signin-refused", every=600)
+    elif email and not await db.admin_has_signed_in_before(email):
+        alerts.alert(f"First sign-in to the admin panel by {email}")
+    await db.record_admin_signin(method=method, outcome=outcome, email=email, address_hash=_address_hash(request),
+                                 user_agent=request.headers.get("user-agent"))
+
+
+def _cookie_secure(request: Request) -> bool:
+    """Secure everywhere but a local test run (Railway terminates TLS, so the browser always used https)."""
+    return (request.url.hostname or "") not in ("localhost", "127.0.0.1")
+
+
+def _session(token: Optional[str]) -> Optional[dict]:
+    """The session a cookie stands for, or None when it is missing, forged, expired or no longer allowed."""
+    if not token:
+        return None
+    try:
+        data = _serializer.loads(token, max_age=SESSION_MAX_AGE)
+    except (BadSignature, SignatureExpired):
+        return None
+    if not isinstance(data, dict):
+        return None
+    if data.get("via") == "google":
+        email = str(data.get("email") or "").lower()
+        # Checked on every request, so taking someone off the list signs them out at once.
+        if ADMIN_ALLOWED_EMAILS and email not in ADMIN_ALLOWED_EMAILS:
+            return None
+        return {"email": email, "via": "google"}
+    # While password sign-in is off, only a session that came from Google sign-in counts: a cookie minted by the
+    # shared password before the switch stops working at once.
+    if not ADMIN_PASSWORD_LOGIN:
+        return None
+    return {"email": "shared password", "via": "password"}
 
 
 def _verify_session(token: Optional[str]) -> bool:
-    """Return True if the token is valid and not expired."""
-    if not token:
-        return False
-    try:
-        _serializer.loads(token, max_age=SESSION_MAX_AGE)
-        return True
-    except (BadSignature, SignatureExpired):
-        return False
+    """Return True if the token is valid, not expired, and its account is still allowed."""
+    return _session(token) is not None
+
+
+def _may_edit(who: dict) -> bool:
+    """Whether this person may change what the bot says or does."""
+    return not ADMIN_EDITORS or who.get("email") in ADMIN_EDITORS
 
 
 def _check_csrf(request: Request) -> None:
     """
-    Light CSRF protection — confirm the request originated from our own host.
-    Browsers always send Origin on cross-origin POSTs and same-origin POSTs
-    from form submits. Server-to-server posts (curl, attackers) typically
-    don't bother to forge it.
-
-    We don't enforce a specific value — we just require that one of Origin
-    or Referer is present. This blocks the simplest CSRF vector (an image
-    tag or auto-submitting form on another site) without needing token
-    plumbing.
+    A request that changes something must come from one of the panel's own pages: its Origin (or, failing that,
+    its Referer) has to name the host the request was sent to. A page on another site cannot forge either, and a
+    request with neither is refused. (This used to accept any value at all, as long as one was present.)
     """
-    if not (request.headers.get("origin") or request.headers.get("referer")):
+    from urllib.parse import urlparse
+    host = (request.headers.get("host") or "").split(":")[0].lower()
+    source = request.headers.get("origin") or request.headers.get("referer") or ""
+    if not source:
         raise HTTPException(status_code=403, detail="Missing Origin/Referer header")
+    if not host or (urlparse(source).hostname or "").lower() != host:
+        raise HTTPException(status_code=403, detail="Request did not come from this site")
 
 
-def require_admin(
+# What each changing request is called in the record, by address. Anything not listed is recorded by its address.
+_ACTION_NAMES = [
+    (re.compile(r"^/admin/overrides$"), "override.create"),
+    (re.compile(r"^/admin/overrides/[^/]+$"), "override.update"),
+    (re.compile(r"^/admin/overrides/[^/]+/toggle$"), "override.toggle"),
+    (re.compile(r"^/admin/overrides/[^/]+/delete$"), "override.delete"),
+    (re.compile(r"^/admin/settings/busy-mode$"), "settings.busy_mode"),
+    (re.compile(r"^/admin/reindex$"), "docs.reindex"),
+    (re.compile(r"^/admin/article-sync$"), "article_sync.propose"),
+    (re.compile(r"^/admin/article-sync/([a-z-]+)$"), "article_sync."),
+]
+# The actions that change what users are told. Each one raises an alert, with its text.
+_ALERTED = ("override.", "settings.", "article_sync.publish")
+# Changing these needs to be an editor (when ADMIN_EDITORS is set).
+_EDITOR_ONLY = re.compile(r"^/admin/(overrides|settings|reindex|article-sync)(/|$)")
+
+
+def _action_name(method: str, path: str) -> str:
+    for pattern, name in _ACTION_NAMES:
+        m = pattern.match(path)
+        if m:
+            return name + (m.group(1).replace("-", "_") if name.endswith(".") else "")
+    return f"{method} {path}"
+
+
+async def require_admin(
     request: Request,
     session: Optional[str] = Cookie(None, alias=SESSION_COOKIE_NAME),
-) -> None:
+):
     """
     Dependency that gates every authenticated admin route.
     Redirects to /admin/login on browser requests, returns 401 for others.
-    """
-    if _verify_session(session):
-        return
 
-    # If this is a normal browser navigation, redirect to login.
-    # If it's an XHR / API call, fail with 401 so the caller can react.
-    accept = request.headers.get("accept", "")
-    if "text/html" in accept:
-        raise HTTPException(
-            status_code=303,
-            detail="Login required",
-            headers={"Location": "/admin/login"},
-        )
-    raise HTTPException(status_code=401, detail="Not authenticated")
+    For a request that changes something it also checks the request came from the panel itself, checks the person
+    may make changes, and, once the route has finished without an error, writes what was done to the record
+    (db.admin_actions) and raises an alert for the changes that matter. Opening one conversation is recorded too.
+    """
+    who = _session(session)
+    if who is None:
+        # If this is a normal browser navigation, redirect to login.
+        # If it's an XHR / API call, fail with 401 so the caller can react.
+        accept = request.headers.get("accept", "")
+        if "text/html" in accept:
+            raise HTTPException(
+                status_code=303,
+                detail="Login required",
+                headers={"Location": "/admin/login"},
+            )
+        raise HTTPException(status_code=401, detail="Not authenticated")
+
+    request.state.admin = who
+    path = request.url.path.rstrip("/") or "/admin"
+    changing = request.method not in ("GET", "HEAD", "OPTIONS")
+    if changing:
+        _check_csrf(request)
+        if _EDITOR_ONLY.match(path) and not _may_edit(who):
+            raise HTTPException(status_code=403, detail="Your account can view the panel but not change what the bot says or does")
+
+    yield
+
+    # Reached only when the route finished without raising.
+    view = request.method == "GET" and re.match(r"^/admin/conversations/[^/]+$", path)
+    if not (changing or view):
+        return
+    action = "conversation.view" if view else _action_name(request.method, path)
+    detail = getattr(request.state, "action_detail", "") or (path.rsplit("/", 1)[-1] if view else "")
+    await db.record_admin_action(email=who["email"], action=action, detail=detail, address_hash=_address_hash(request))
+    if action.startswith(_ALERTED):
+        alerts.alert(f"{who['email']} did {action}" + (f": {detail[:1200]}" if detail else ""))
 
 
 # ─── HTML helpers ─────────────────────────────────────────────────────────────
@@ -535,6 +660,8 @@ def _page(title: str, body: str, show_nav: bool = True, head_extra: str = "") ->
           <a href="/admin">Controls</a>
           <a href="/admin/conversations">Conversations</a>
           <a href="/admin/stats">Stats</a>
+          <a href="/admin/sign-ins">Sign-ins</a>
+          <a href="/admin/actions">Actions</a>
           <a href="/admin/logout">Sign out</a>
         </nav>
         """
@@ -628,9 +755,31 @@ async def login_form(error: Optional[str] = None):
         </form>
     """
 
+    password_details = f"""
+            <details style="margin-top:22px; text-align:left;">
+              <summary class="dim" style="cursor:pointer; text-align:center;
+                       font-size:13px; list-style:none;">
+                Use admin password instead
+              </summary>
+              {password_form}
+            </details>
+    """ if ADMIN_PASSWORD_LOGIN else ""
+
+    if not _google_oauth_enabled() and not ADMIN_PASSWORD_LOGIN:
+        body = f"""
+        <div style="max-width: 380px; margin: 80px auto;">
+          <div class="panel">
+            <h3>Sign in</h3>
+            {flash}
+            <p class="dim">Sign-in is not set up on this server.</p>
+          </div>
+        </div>
+        """
+        return HTMLResponse(_page("Sign in", body, show_nav=False))
+
     if _google_oauth_enabled():
-        # Google is the primary path; the shared-password fallback lives
-        # behind a <details> toggle so the page stays clean (and no JS needed).
+        # People sign in with Google. The shared-password form appears only where
+        # ADMIN_PASSWORD_LOGIN is on.
         body = f"""
         <div style="max-width: 380px; margin: 80px auto;">
           <div class="panel" style="text-align:center; padding: 32px 28px;">
@@ -644,13 +793,7 @@ async def login_form(error: Optional[str] = None):
                text-decoration:none; border:1px solid #dadce0;">
               {_google_svg} Sign in with Google
             </a>
-            <details style="margin-top:22px; text-align:left;">
-              <summary class="dim" style="cursor:pointer; text-align:center;
-                       font-size:13px; list-style:none;">
-                Use admin password instead
-              </summary>
-              {password_form}
-            </details>
+            {password_details}
           </div>
         </div>
         """
@@ -672,6 +815,13 @@ async def login_form(error: Optional[str] = None):
 async def login_submit(request: Request, password: str = Form(...)):
     _check_csrf(request)
 
+    if not ADMIN_PASSWORD_LOGIN:
+        await _record_signin(request, "password", "password_off")
+        return RedirectResponse(
+            "/admin/login?error=Password+sign-in+is+turned+off.+Use+your+work+Google+account.",
+            status_code=303,
+        )
+
     if not ADMIN_PASSWORD:
         # Configured wrong — refuse rather than authenticate anybody
         return RedirectResponse(
@@ -681,6 +831,7 @@ async def login_submit(request: Request, password: str = Form(...)):
 
     # Constant-time comparison so we don't leak length/prefix info.
     if not secrets.compare_digest(password.encode(), ADMIN_PASSWORD.encode()):
+        await _record_signin(request, "password", "wrong_password")
         return RedirectResponse(
             "/admin/login?error=Incorrect+password",
             status_code=303,
@@ -693,9 +844,9 @@ async def login_submit(request: Request, password: str = Form(...)):
         max_age=SESSION_MAX_AGE,
         httponly=True,
         samesite="lax",
-        secure=False,  # Set True if you put this behind HTTPS only (Railway gives you HTTPS by default)
+        secure=_cookie_secure(request),
     )
-    log.info("Admin login successful")
+    await _record_signin(request, "password", "ok")
     return response
 
 
@@ -758,6 +909,7 @@ async def google_auth_callback(
     try:
         _serializer.loads(state, max_age=600)
     except (BadSignature, SignatureExpired):
+        await _record_signin(request, "google", "expired_state")
         return RedirectResponse("/admin/login?error=Sign-in+expired+—+try+again", status_code=303)
 
     import httpx
@@ -784,6 +936,7 @@ async def google_auth_callback(
             info = ui.json()
     except Exception as e:
         log.error(f"Google OAuth exchange failed: {e}")
+        await _record_signin(request, "google", "google_failed")
         return RedirectResponse("/admin/login?error=Google+sign-in+failed", status_code=303)
 
     email = (info.get("email") or "").lower()
@@ -792,9 +945,16 @@ async def google_auth_callback(
 
     # The actual gate: verified email on an allowed Workspace domain.
     if not (verified and domain in OAUTH_ALLOWED_DOMAINS):
-        log.warning(f"OAuth login REFUSED for {email!r} (verified={verified})")
+        await _record_signin(request, "google", "refused_account", email or None)
         return RedirectResponse(
             "/admin/login?error=Use+your+work+Google+account", status_code=303
+        )
+
+    # On the company's domain, but is this person meant to be here?
+    if ADMIN_ALLOWED_EMAILS and email not in ADMIN_ALLOWED_EMAILS:
+        await _record_signin(request, "google", "refused_not_listed", email)
+        return RedirectResponse(
+            "/admin/login?error=Your+account+has+not+been+given+access+to+this+panel", status_code=303
         )
 
     response = RedirectResponse("/admin", status_code=303)
@@ -808,10 +968,90 @@ async def google_auth_callback(
         max_age=SESSION_MAX_AGE,
         httponly=True,
         samesite="lax",
-        secure=False,
+        secure=_cookie_secure(request),
     )
-    log.info(f"Admin login successful via Google: {email}")
+    await _record_signin(request, "google", "ok", email)
     return response
+
+
+# ─── Sign-in record ─────────────────────────────────────────────────────────
+
+_SIGNIN_OUTCOME = {
+    "ok": "Signed in",
+    "refused_account": "Account not allowed",
+    "refused_not_listed": "Not on the access list",
+    "google_failed": "Google sign-in failed",
+    "expired_state": "Sign-in link expired",
+    "password_off": "Password sign-in is off",
+    "wrong_password": "Wrong password",
+}
+
+
+@router.get("/sign-ins", response_class=HTMLResponse)
+async def signins_page(_: None = Depends(require_admin)):
+    data = await db.get_admin_signins(200)
+    if not data.get("enabled"):
+        body = '<div class="panel"><h3>Sign-ins</h3><p class="dim">The database is not connected, so sign-ins are not being recorded.</p></div>'
+        return HTMLResponse(_page("Sign-ins", body))
+    rows = "".join(
+        f"""<tr>
+          <td style="white-space:nowrap">{_esc(r["at"].strftime("%b %d, %H:%M:%S UTC"))}</td>
+          <td>{_esc(r["email"]) or "&mdash;"}</td>
+          <td>{"Google" if r["method"] == "google" else "Password"}</td>
+          <td style="color:{'#4ade80' if r["ok"] else '#f5a623'}">{_esc(_SIGNIN_OUTCOME.get(r["outcome"], r["outcome"]))}</td>
+          <td class="dim" style="font-family:monospace" title="{_esc(r["user_agent"])}">{_esc(r["address_hash"]) or "&mdash;"}</td>
+        </tr>"""
+        for r in data["rows"]
+    ) or '<tr><td colspan="5" class="dim">No sign-ins on record yet. Recording starts with the first sign-in after this was added.</td></tr>'
+    body = f"""
+    <div class="panel">
+      <h3>Sign-ins</h3>
+      <p class="dim">Last 24 hours: <strong>{data["ok_24h"]}</strong> signed in, <strong>{data["refused_24h"]}</strong> refused.
+      {"The record could not be read just now." if data.get("error") else ""}</p>
+      <div style="max-height:520px; overflow:auto;">
+        <table style="width:100%; border-collapse:collapse;">
+          <thead><tr style="text-align:left"><th>When</th><th>Account</th><th>How</th><th>Result</th><th>From</th></tr></thead>
+          <tbody>{rows}</tbody>
+        </table>
+      </div>
+      <p class="dim" style="margin-top:10px">The last 200 attempts. &ldquo;From&rdquo; is a scrambled form of the address: the same code means the same place, and the address itself is not kept.</p>
+    </div>
+    """
+    return HTMLResponse(_page("Sign-ins", body))
+
+
+@router.get("/actions", response_class=HTMLResponse)
+async def actions_page(_: None = Depends(require_admin)):
+    data = await db.get_admin_actions(300)
+    who_can = (f"{len(ADMIN_ALLOWED_EMAILS)} named account{'s' if len(ADMIN_ALLOWED_EMAILS) != 1 else ''} may sign in"
+               if ADMIN_ALLOWED_EMAILS else "<strong>Any account on the company domain may sign in: no access list is set (ADMIN_ALLOWED_EMAILS).</strong>")
+    who_edits = (f"{len(ADMIN_EDITORS)} of them may change what the bot says" if ADMIN_EDITORS else "everyone who may sign in may change what the bot says")
+    if not data.get("enabled"):
+        body = f'<div class="panel"><h3>Actions</h3><p class="dim">{who_can}; {who_edits}.</p><p class="dim">The database is not connected, so actions are not being recorded.</p></div>'
+        return HTMLResponse(_page("Actions", body))
+    rows = "".join(
+        f"""<tr>
+          <td style="white-space:nowrap; vertical-align:top">{_esc(r["at"].strftime("%b %d, %H:%M:%S UTC"))}</td>
+          <td style="vertical-align:top">{_esc(r["email"]) or "&mdash;"}</td>
+          <td style="vertical-align:top; white-space:nowrap">{_esc(r["action"])}</td>
+          <td class="dim" style="max-width:560px; overflow-wrap:anywhere">{_esc(r["detail"]) or ""}</td>
+        </tr>"""
+        for r in data["rows"]
+    ) or '<tr><td colspan="4" class="dim">Nothing on record yet. Recording starts with the first change after this was added.</td></tr>'
+    body = f"""
+    <div class="panel">
+      <h3>Actions</h3>
+      <p class="dim">{who_can}; {who_edits}. {"The record could not be read just now." if data.get("error") else ""}</p>
+      <div style="max-height:560px; overflow:auto;">
+        <table style="width:100%; border-collapse:collapse;">
+          <thead><tr style="text-align:left"><th>When</th><th>Who</th><th>What</th><th>Detail</th></tr></thead>
+          <tbody>{rows}</tbody>
+        </table>
+      </div>
+      <p class="dim" style="margin-top:10px">The last 300: every change made through this panel, and every conversation opened.</p>
+    </div>
+    """
+    return HTMLResponse(_page("Actions", body))
 
 
 # ─── Dashboard (override list) ────────────────────────────────────────────────
@@ -1154,6 +1394,7 @@ async def settings_busy_mode(
         busy_mode_enabled=bool(busy_mode_enabled),
         busy_mode_roles=roles,
     )
+    request.state.action_detail = f"busy mode {'on' if busy_mode_enabled else 'off'}; staff roles: {', '.join(roles) or 'none'}"
     return RedirectResponse("/admin", status_code=303)
 
 
@@ -1263,6 +1504,7 @@ async def overrides_create(
         starts_at=_parse_dt(starts_at),
         ends_at=_parse_dt(ends_at),
     )
+    request.state.action_detail = f"{name!r}; keywords {', '.join(kw_list)}; says: {message}"
     return RedirectResponse("/admin", status_code=303)
 
 
@@ -1348,6 +1590,7 @@ async def override_update(
     )
     if not updated:
         raise HTTPException(status_code=404, detail="Override not found")
+    request.state.action_detail = f"{oid}: {name!r}; keywords {', '.join(kw_list)}; says: {message}"
     return RedirectResponse("/admin", status_code=303)
 
 
@@ -1362,6 +1605,7 @@ async def override_toggle(
     if not o:
         raise HTTPException(status_code=404, detail="Override not found")
     await update_override(oid, enabled=not o.get("enabled", True))
+    request.state.action_detail = f"{oid}: {o.get('name')!r} turned {'off' if o.get('enabled', True) else 'on'}; says: {o.get('message', '')}"
     return RedirectResponse("/admin", status_code=303)
 
 
@@ -1372,7 +1616,9 @@ async def override_delete(
     _: None = Depends(require_admin),
 ):
     _check_csrf(request)
+    gone = await get_override(oid)
     await delete_override(oid)
+    request.state.action_detail = f"{oid}: {(gone or {}).get('name')!r} deleted; it said: {(gone or {}).get('message', '')}"
     return RedirectResponse("/admin", status_code=303)
 
 

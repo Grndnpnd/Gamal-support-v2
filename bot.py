@@ -35,6 +35,8 @@ from redis_overrides import find_matching_override, record_override_hit
 from redis_settings import get_settings
 from redis_pubsub import listen_for_reindex, set_reindex_status, heal_stale_reindex_status
 import db
+import alerts
+import internal_auth
 
 load_dotenv()
 
@@ -635,6 +637,8 @@ class BankrSupportBot(discord.Client):
 
     async def on_ready(self):
         log.info(f"Logged in as {self.user} (ID: {self.user.id})")
+        # Discord calls this again after every reconnect, so at most one alert an hour.
+        alerts.alert(f"The bot connected to Discord as {self.user} (a deploy, a restart or a reconnect)", key="bot-ready", every=3600)
         log.info(
             f"Monitoring {'all channels' if not MONITORED_CHANNEL_IDS else f'channels: {MONITORED_CHANNEL_IDS}'}"
         )
@@ -1345,6 +1349,8 @@ Choose the single best-fit value from this fixed list ONLY:
                         async with session.post(
                             f"{WEBHOOK_SERVER_URL}/cancel-deletion",
                             json={"thread_id": thread_id},
+                            # Signed, so the webhook process knows the call is the bot's (internal_auth.py).
+                            headers={internal_auth.HEADER: internal_auth.sign("cancel-deletion", thread_id)},
                             timeout=aiohttp.ClientTimeout(total=5),
                         ) as resp:
                             data = await resp.json()

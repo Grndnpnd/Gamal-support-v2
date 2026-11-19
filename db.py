@@ -104,6 +104,107 @@ CREATE INDEX IF NOT EXISTS idx_conv_session         ON conversations (session_id
 """
 
 
+# Every attempt to sign in to the admin panel, whether it got in or not. The address is kept only as a keyed hash.
+_SIGNIN_SCHEMA = """
+CREATE TABLE IF NOT EXISTS admin_signins (
+    id            BIGSERIAL PRIMARY KEY,
+    at            TIMESTAMPTZ NOT NULL DEFAULT now(),
+    method        TEXT NOT NULL,                 -- 'google' | 'password'
+    outcome       TEXT NOT NULL,                 -- 'ok' | 'refused_account' | 'google_failed' | 'expired_state' | 'password_off' | 'wrong_password'
+    ok            BOOLEAN NOT NULL DEFAULT FALSE,
+    email         TEXT,
+    address_hash  TEXT,
+    user_agent    TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_admin_signins_at ON admin_signins (at DESC);
+"""
+
+
+_ACTIONS_SCHEMA = """
+CREATE TABLE IF NOT EXISTS admin_actions (
+    id            BIGSERIAL PRIMARY KEY,
+    at            TIMESTAMPTZ NOT NULL DEFAULT now(),
+    email         TEXT,                          -- who (the signed-in Google account; 'shared password' if that is on)
+    action        TEXT NOT NULL,                 -- 'override.create' | 'override.update' | 'settings.busy_mode' | 'conversation.view' | ...
+    detail        TEXT,                          -- what: the override's name, keywords and message, the setting's new value
+    address_hash  TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_admin_actions_at ON admin_actions (at DESC);
+"""
+
+
+async def record_admin_action(*, email: Optional[str], action: str, detail: Optional[str] = None,
+                              address_hash: Optional[str] = None) -> None:
+    """Write one admin action. Never raises: the record must not get in the way of the action."""
+    if _pool is None:
+        return
+    try:
+        async with _pool.acquire() as conn:
+            await conn.execute(
+                "INSERT INTO admin_actions (email, action, detail, address_hash) VALUES ($1, $2, $3, $4)",
+                (email or None) and email[:200], action[:80], (detail or None) and detail[:4000], address_hash,
+            )
+    except Exception as e:
+        log.error(f"record_admin_action failed (swallowed): {e}")
+
+
+async def get_admin_actions(limit: int = 300) -> dict:
+    """The newest admin actions."""
+    if _pool is None:
+        return {"enabled": False, "rows": []}
+    try:
+        async with _pool.acquire() as conn:
+            rows = await conn.fetch("SELECT at, email, action, detail, address_hash FROM admin_actions ORDER BY at DESC LIMIT $1", limit)
+        return {"enabled": True, "rows": [dict(r) for r in rows]}
+    except Exception as e:
+        log.error(f"get_admin_actions failed: {e}")
+        return {"enabled": True, "rows": [], "error": True}
+
+
+async def admin_has_signed_in_before(email: str) -> bool:
+    """True when this account has a successful sign-in on record. With no database the answer is True, so a missing
+    record never raises a false 'first sign-in' alarm."""
+    if _pool is None or not email:
+        return True
+    try:
+        async with _pool.acquire() as conn:
+            return bool(await conn.fetchval("SELECT 1 FROM admin_signins WHERE ok AND email = $1 LIMIT 1", email))
+    except Exception:
+        return True
+
+
+async def record_admin_signin(*, method: str, outcome: str, email: Optional[str] = None,
+                              address_hash: Optional[str] = None, user_agent: Optional[str] = None) -> None:
+    """Write one sign-in attempt. Never raises: recording must not get in the way of signing in."""
+    if _pool is None:
+        return
+    try:
+        async with _pool.acquire() as conn:
+            await conn.execute(
+                "INSERT INTO admin_signins (method, outcome, ok, email, address_hash, user_agent) VALUES ($1, $2, $3, $4, $5, $6)",
+                method, outcome, outcome == "ok", (email or None) and email[:200], address_hash, (user_agent or None) and user_agent[:200],
+            )
+    except Exception as e:
+        log.error(f"record_admin_signin failed (swallowed): {e}")
+
+
+async def get_admin_signins(limit: int = 200) -> dict:
+    """The newest sign-in attempts, plus how many got in and how many were refused in the last 24 hours."""
+    if _pool is None:
+        return {"enabled": False, "rows": [], "ok_24h": 0, "refused_24h": 0}
+    try:
+        async with _pool.acquire() as conn:
+            rows = await conn.fetch(
+                "SELECT at, method, outcome, ok, email, address_hash, user_agent FROM admin_signins ORDER BY at DESC LIMIT $1", limit)
+            c = await conn.fetchrow(
+                "SELECT count(*) FILTER (WHERE ok) AS ok_n, count(*) FILTER (WHERE NOT ok) AS refused_n "
+                "FROM admin_signins WHERE at > now() - interval '24 hours'")
+        return {"enabled": True, "rows": [dict(r) for r in rows], "ok_24h": c["ok_n"], "refused_24h": c["refused_n"]}
+    except Exception as e:
+        log.error(f"get_admin_signins failed: {e}")
+        return {"enabled": True, "rows": [], "ok_24h": 0, "refused_24h": 0, "error": True}
+
+
 # ─── Lifecycle ────────────────────────────────────────────────────────────────
 
 async def init_db() -> None:
@@ -134,6 +235,8 @@ async def init_db() -> None:
         )
         async with _pool.acquire() as conn:
             await conn.execute(_SCHEMA)
+            await conn.execute(_SIGNIN_SCHEMA)
+            await conn.execute(_ACTIONS_SCHEMA)
         log.info("Postgres connected — conversations table ready, stats logging ENABLED")
     except Exception as e:
         log.error(f"Postgres init failed: {e} — stats logging disabled")
