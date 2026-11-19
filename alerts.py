@@ -35,8 +35,8 @@ def _due(key: str, every: float, now: float) -> tuple[bool, int]:
     """Whether an alert of this kind may go now, and how many were held back since the last one that went."""
     if every <= 0:
         return True, 0
-    last = _last.get(key, 0.0)
-    if now - last < every:
+    last = _last.get(key)          # None = never sent. (The clock here counts from boot, so 0 would not mean 'long ago'.)
+    if last is not None and now - last < every:
         _held[key] = _held.get(key, 0) + 1
         return False, 0
     _last[key] = now

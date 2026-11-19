@@ -78,10 +78,6 @@ async def _cleanup():
         await conn.execute("delete from admin_actions where email = any($1::text[])", [ALICE, BOB, EVE])
     finally:
         await conn.close()
-    from redis_overrides import list_overrides, delete_override
-    for o in await list_overrides():
-        if o.get("name") == OVERRIDE["name"]:
-            await delete_override(o["id"])
 
 
 with TestClient(app, base_url=f"https://{HOST}", follow_redirects=False) as c:
@@ -126,8 +122,13 @@ with TestClient(app, base_url=f"https://{HOST}", follow_redirects=False) as c:
 
     # ── editors ──
     ar.ADMIN_EDITORS = [ALICE]
-    from redis_overrides import list_overrides
-    oid = next(o["id"] for o in asyncio.run(list_overrides()) if o.get("name") == OVERRIDE["name"])
+    # The override's id, read from the panel's own page (the row that carries its name).
+    import re
+    page = c.get("/admin", headers={"accept": "text/html"}, cookies=cookie(ALICE)).text
+    at = page.find(OVERRIDE["name"])
+    found = re.search(r"/admin/overrides/([A-Za-z0-9_-]+)/", page[at:]) if at >= 0 else None
+    check("the new override is listed on the panel", bool(found), page[max(0, at - 200):at + 300] if at >= 0 else "name not on the page")
+    oid = found.group(1) if found else "missing"
     r = c.post(f"/admin/overrides/{oid}/toggle", headers=OWN, cookies=cookie(BOB))
     check("someone who may sign in but is not an editor cannot change an override", r.status_code == 403 and "view the panel" in r.text, f"{r.status_code} {r.text[:120]}")
     r = c.post("/admin/settings/busy-mode", data={"busy_mode_roles": "Moderator"}, headers=OWN, cookies=cookie(BOB))
