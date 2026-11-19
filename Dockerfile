@@ -9,9 +9,9 @@ ENV PYTHONUNBUFFERED=1 PYTHONDONTWRITEBYTECODE=1 PIP_NO_CACHE_DIR=1 \
     HF_HOME=/opt/models ANONYMIZED_TELEMETRY=False
 
 WORKDIR /app
-COPY requirements.txt constraints.txt ./
+COPY requirements.txt ./
 # The CPU build of torch: the default one carries GPU libraries several times the size of everything else here.
-RUN pip install --index-url https://download.pytorch.org/whl/cpu -c constraints.txt torch \
+RUN pip install --index-url https://download.pytorch.org/whl/cpu "$(grep -E "^torch==" requirements.txt)" \
  && pip install -r requirements.txt
 
 # The embedding model is fetched once, at build, so a start never waits on (or fails with) the model host.
